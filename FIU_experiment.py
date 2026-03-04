@@ -1,4 +1,4 @@
-import json
+import json 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -54,7 +54,6 @@ def unzip_file(filepath):
 # ---------------------------------
 # FILTERING bandpass instead of lowpass(commented out above)
 # ---------------------------------
-
 # def bandpass_filter(signal, low_hz, high_hz, fs, order=4):
 #     """
 #     4th-order Butterworth bandpass filter (0.5–8 Hz), zero-phase.
@@ -80,8 +79,6 @@ def bandpass_filter(signal, low_hz, high_hz, fs, order=4, rs=20):
 
     cheby = cheby2(order, rs, [low, high], btype="bandpass", output="sos")
     return sosfiltfilt(cheby, signal)
-
-
 
 # ---------------------------------
 # WINDOWING + PREPROCESSING (NEW for SQI)
@@ -847,3 +844,151 @@ def process_day4_experiment(exp_label):
 # Run both Day 4 experiments
 process_day4_experiment("Experiment 2")
 process_day4_experiment("Experiment 3")
+
+# ============================================================
+# Make PI bar plots for all conditions found in FIU_Cleaned_Data
+# ============================================================
+
+def _parse_pol_and_wavelength(channel_name: str):
+    """
+    Channel examples:
+      'Unpolarized_A_Green', 'Unpolarized_B_IR', 'Co-Polarized_Red', 'Cross-Polarized_Green'
+    Returns: (pol_group, wavelength) or (None, None)
+    """
+    if not isinstance(channel_name, str):
+        return None, None
+
+    parts = channel_name.split("_")
+    if len(parts) < 2:
+        return None, None
+
+    wavelength = parts[-1]  # Green / Red / IR
+
+    if channel_name.startswith("Unpolarized_A") or channel_name.startswith("Unpolarized_B"):
+        pol_group = "Unpolarized"
+    elif channel_name.startswith("Co-Polarized"):
+        pol_group = "Co-Polarized"
+    elif channel_name.startswith("Cross-Polarized"):
+        pol_group = "Cross-Polarized"
+    else:
+        return None, None
+
+    if wavelength not in ["Green", "Red", "IR"]:
+        return None, None
+
+    return pol_group, wavelength
+
+
+def make_pi_barplots_all_conditions(
+    cleaned_root="FIU_Cleaned_Data",
+    out_root="FIU_Plots_PI_Bars",
+):
+    summary_files = glob.glob(os.path.join(cleaned_root, "**", "summary.csv"), recursive=True)
+    if not summary_files:
+        print(f"No summary.csv found under {cleaned_root}")
+        return
+
+    dfs = []
+    for f in summary_files:
+        try:
+            d = pd.read_csv(f)
+            d["_summary_path"] = f
+            dfs.append(d)
+        except Exception as e:
+            print(f"Skipping {f}: {e}")
+
+    all_df = pd.concat(dfs, ignore_index=True)
+
+    # PI only
+    pi_df = all_df[all_df.get("Metric") == "PI"].copy()
+    if pi_df.empty:
+        print("No PI rows found in the summary files.")
+        return
+
+    # add PolGroup + Wavelength
+    pol_wl = pi_df["Channel"].apply(_parse_pol_and_wavelength)
+    pi_df["PolGroup"] = pol_wl.apply(lambda x: x[0])
+    pi_df["Wavelength"] = pol_wl.apply(lambda x: x[1])
+    pi_df = pi_df.dropna(subset=["PolGroup", "Wavelength", "Mean"])
+
+    # Build plot grouping keys dynamically 
+    preferred_keys = [
+        "Day", "Experiment",
+        "SkinTone", "Depth", "Speed",          # Day 1/2
+        "Orientation", "Pol", "Session",       # Day 3/4 (as applicable)
+        "Condition"                            # Day 3 calibration labels
+    ]
+    plot_keys = [k for k in preferred_keys if k in pi_df.columns]
+
+    if not plot_keys:
+        plot_keys = ["Participant"] if "Participant" in pi_df.columns else []
+
+    pol_order = ["Unpolarized", "Co-Polarized", "Cross-Polarized"]
+    wl_order = ["Green", "Red", "IR"]
+
+    os.makedirs(out_root, exist_ok=True)
+
+    # Aggregate Mean PI within each condition/pol/wavelength
+    agg = (
+        pi_df.groupby(plot_keys + ["PolGroup", "Wavelength"], dropna=False)["Mean"]
+        .apply(lambda s: np.nanmean(np.abs(s)))
+        .reset_index(name="Mean")
+    )
+
+    def _plot_one(sub_df, title, out_path):
+        vals = {(p, w): np.nan for p in pol_order for w in wl_order}
+        for _, r in sub_df.iterrows():
+            vals[(r["PolGroup"], r["Wavelength"])] = r["Mean"]
+
+        x = np.arange(len(pol_order))
+        bar_w = 0.22
+        offsets = [-bar_w, 0.0, bar_w]
+
+        plt.figure(figsize=(9, 5))
+        for i, wl in enumerate(wl_order):
+            y = [vals[(p, wl)] for p in pol_order]
+            plt.bar(x + offsets[i], y, width=bar_w, label=wl)
+
+        plt.xticks(x, pol_order)
+        plt.ylabel("Average PI (best window)")
+        plt.ylim(bottom=0) 
+        plt.title(title)
+        plt.grid(True, axis="y", linestyle="--", alpha=0.4)
+        plt.legend(title="Wavelength")
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=300)
+        plt.close()
+
+    # One plot per condition group
+    for keys, sub in agg.groupby(plot_keys, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+
+        key_dict = dict(zip(plot_keys, keys))
+
+        # Title
+        title_parts = []
+        for k in plot_keys:
+            v = key_dict.get(k, "")
+            if pd.isna(v) or v == "":
+                continue
+            title_parts.append(f"{v}")
+
+        title = " | ".join(title_parts) if title_parts else "PI Bar Plot"
+
+        # Filename safe
+        fname = "_".join(title_parts).replace(" ", "").replace(".", "").replace("|", "_")
+        if not fname:
+            fname = "PI_barplot"
+        out_path = os.path.join(out_root, f"{fname}.png")
+
+        _plot_one(sub, title, out_path)
+
+    print(f"Done. Saved plots to: {out_root}")
+    print(f"Found {len(summary_files)} summary.csv files and made {agg.groupby(plot_keys).ngroups} plots.")
+ 
+
+make_pi_barplots_all_conditions(
+    cleaned_root="FIU_Cleaned_Data",
+    out_root="FIU_Plots_PI_Bars"
+)

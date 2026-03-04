@@ -1,0 +1,15 @@
+{
+  "workbench.colorTheme": "Default Dark+",
+  "editor.semanticHighlighting.enabled": true,
+  "python.analysis.semanticTokenColorCustomizations.enabled": true,
+  "editor.semanticTokenColorCustomizations": {
+    "[Default Dark+]": {
+      "enabled": true,
+      "rules": {
+        "variable": "#9CDCFE",
+        "parameter": "#9CDCFE",
+        "property": "#9CDCFE"
+      }
+    }
+  }
+}
