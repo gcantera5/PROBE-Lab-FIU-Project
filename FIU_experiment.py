@@ -2,15 +2,13 @@ import json
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import butter, filtfilt, find_peaks, detrend  
+from scipy.signal import butter, filtfilt, find_peaks, detrend
+from scipy.signal import cheby2, sosfiltfilt, find_peaks, detrend
 from scipy.stats import skew    
 import os
 import glob
 import gzip
 import shutil
-
-## add a Read me with start up details 
-# flow diagram to capture how we inout data, steps to filtering window, add to read me, explaining outputs and signal processing
 
 # ============================================================
 # CONFIG (SQI)
@@ -19,7 +17,7 @@ FS = 25                   # sampling frequency (Hz)
 SQI_WINDOW_SEC = 10       # configurable 5–10 sec window
 SQI_STEP_SEC = 1          # required 1 sec stride
 BP_LOW_HZ = 0.5           # bandpass low cutoff
-BP_HIGH_HZ = 8.0          # bandpass high cutoff
+BP_HIGH_HZ = 2.2          # bandpass high cutoff
 BP_ORDER = 4              # 4th order bandpass
 
 
@@ -54,18 +52,35 @@ def unzip_file(filepath):
 #     return filtfilt(b, a, signal)
 
 # ---------------------------------
-# FILTERING bandpass instead of lowpass)
+# FILTERING bandpass instead of lowpass(commented out above)
 # ---------------------------------
-def bandpass_filter(signal, low_hz, high_hz, fs, order=4):
+
+# def bandpass_filter(signal, low_hz, high_hz, fs, order=4):
+#     """
+#     4th-order Butterworth bandpass filter (0.5–8 Hz), zero-phase.
+#     """
+#     signal = np.asarray(signal, dtype=float)
+#     nyq = fs / 2.0
+#     low = low_hz / nyq
+#     high = high_hz / nyq
+#     b, a = butter(order, [low, high], btype="bandpass")
+#     return filtfilt(b, a, signal)
+
+# Chebyshev type 2, order 4
+
+def bandpass_filter(signal, low_hz, high_hz, fs, order=4, rs=20):
     """
-    4th-order Butterworth bandpass filter (0.5–8 Hz), zero-phase.
+    4th-order Chebyshev Type II bandpass filter (zero-phase), as in the paper:
+    cheby2(order, 20, [fL fH]/Fn)  -> rs=20 dB stopband attenuation.
     """
     signal = np.asarray(signal, dtype=float)
     nyq = fs / 2.0
     low = low_hz / nyq
     high = high_hz / nyq
-    b, a = butter(order, [low, high], btype="bandpass")
-    return filtfilt(b, a, signal)
+
+    cheby = cheby2(order, rs, [low, high], btype="bandpass", output="sos")
+    return sosfiltfilt(cheby, signal)
+
 
 
 # ---------------------------------
@@ -91,7 +106,7 @@ def iter_windows(x, fs, window_sec=8, step_sec=1):
         yield start, end, x[start:end]
 
 
-def preprocess_window_ppg(win, fs, low_hz=0.5, high_hz=8.0, order=4):
+def preprocess_window_ppg(win, fs, low_hz=BP_LOW_HZ, high_hz=BP_HIGH_HZ, order=BP_ORDER):
     """
       1) bandpass filter
       2) zero-center (subtract DC per window)
@@ -181,7 +196,7 @@ def plot_best_window(signal, fs, condition_info, label,
     if proc is None:
         return sqi_df, None
 
-    proc = -proc
+    proc = -proc 
 
     # Label building 
     graph_channel = channel_name_map(label)
@@ -832,23 +847,3 @@ def process_day4_experiment(exp_label):
 # Run both Day 4 experiments
 process_day4_experiment("Experiment 2")
 process_day4_experiment("Experiment 3")
-
-
-
-"""
-plot a good 10 second window window for each file experiment -- COMPLETE DAY 1
-
-make sure the graohs are inverted -- exoect notch to be on the right
-
-find the skweness of a signal
-
-want to have windowing in our signal, windowing will allow us to define where ppg signal is good enoguh to calculate prefusion index
-
-tell us wherether we should include that part in the signal to include in the mean or not.
-want to define morphalogy of the signal with skweness
-
-based on skweness well know if we have a good signial if we have a pos skewness
-
-_______________________________________________________________________________________
-
-"""
