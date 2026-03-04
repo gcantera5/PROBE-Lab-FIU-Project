@@ -136,7 +136,7 @@ def compute_sqi_windows(signal, condition_info, label, fs=25,
     for start, end, win in iter_windows(signal, fs, window_sec, step_sec):
         proc = preprocess_window_ppg(win, fs, low_hz, high_hz, order)
         if proc is None:
-            continue
+            continue 
 
         rows.append({
             "Channel": label,
