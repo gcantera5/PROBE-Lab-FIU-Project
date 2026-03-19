@@ -32,7 +32,6 @@ This ensures that results are based on high-quality signal segments, making comp
 
 ## Channel Map
 
-```python
 CHANNEL_MAP = {
     "Unpolarized_A": {"Green": "c5",  "Red": "c2",  "IR": "c4"},
     "Unpolarized_B": {"Green": "c11", "Red": "c8",  "IR": "c10"},
@@ -40,7 +39,7 @@ CHANNEL_MAP = {
     "Cross-Polarized": {"Green": "c19", "Red": "c18", "IR": "c21"},
 }
 
-# Explanation of Signal Processing Pipeline
+## Explanation of Signal Processing Pipeline
 
 ## Overview
 
