@@ -10,6 +10,8 @@ import glob
 import gzip
 import shutil
 
+# add summary to ReadMe file
+
 # ============================================================
 # CONFIG (SQI)
 # ============================================================
@@ -171,7 +173,7 @@ def pick_best_window(sqi_df, min_std=0.02):
 
 def plot_best_window(signal, fs, condition_info, label,
                      window_sec=10, step_sec=1,
-                     low_hz=0.5, high_hz=8.0, order=4,
+                     low_hz=BP_LOW_HZ, high_hz=BP_HIGH_HZ, order=4,
                      min_std=0.02):
     """
     Create and save a plot of the best 10s window (processed).
