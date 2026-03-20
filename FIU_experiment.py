@@ -10,7 +10,6 @@ import glob
 import gzip
 import shutil
 
-# add summary to ReadMe file
 
 # ============================================================
 # CONFIG (SQI)

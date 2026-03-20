@@ -1,33 +1,76 @@
 # FIU Pulse Oximetry Analysis Pipeline
 
-## Overview
+# FIU Pulse Oximetry Analysis Pipeline
 
-This project processes photoplethysmography (PPG) data collected from a phantom-based pulse oximetry study. The goal is to evaluate how polarization, skin tone, vessel depth, flow speed, wavelength, and device orientation affect signal quality and perfusion index (PI).
-
-This pipeline provides a structured and reproducible workflow for:
-
-- loading and organizing raw experimental data  
-- cleaning and extracting relevant PPG signals  
-- evaluating signal quality using sliding window metrics  
-- selecting the best-quality segment of each signal  
-- computing perfusion index from reliable data  
-- generating plots and summary tables for analysis  
+The objective of this study is to evaluate how physiological parameters and polarization conditions, including unpolarized, co polarized, and cross polarized light, affect the perfusion index and overall signal quality measured by our device. Using a controlled phantom setup allows us to systematically vary factors such as skin color, optical depth, and flow speed while minimizing the variability typically seen in human testing. This approach makes it possible to isolate the effect of each parameter on PPG detection and to assess the device’s limitations under different optical and physical conditions. By analyzing performance across skin tones and depths, we aim to identify which polarization state provides the most reliable and consistent PPG measurements. Together, these investigations will validate the device’s detection capabilities and guide improvements for future human testing.
 
 ---
 
-## What This Pipeline Does (Intuition)
+## Overview
 
-PPG signals are not always clean. Some parts of the signal look good and show clear pulsatile behavior, while other parts may be noisy, flat, or unstable.
+This pipeline is designed to:
 
-Instead of trusting the entire signal, this pipeline:
+- load and organize raw experimental data
+- clean and extract relevant PPG signals
+- evaluate signal quality using sliding window metrics
+- select the best-quality segment of each signal
+- compute perfusion index from reliable data
+- generate plots and summary tables for downstream analysis
 
-1. breaks the signal into smaller windows  
-2. evaluates the quality of each window  
-3. selects the best window  
-4. computes metrics only from that window  
+Rather than trusting the entire signal equally, the pipeline identifies the most reliable segment of each recording and computes metrics from that portion only. This improves consistency across experimental conditions and reduces the effect of noise, drift, or unstable signal segments.
 
-This ensures that results are based on high-quality signal segments, making comparisons across experimental conditions more reliable.
+---
 
+## Study Design
+
+The phantom study was built around a factorial design that varied key optical and physiological parameters:
+
+- 3 skin tones
+- 3 phantom flow speeds
+- 3 vessel depths
+- 3 polarization conditions
+
+This gives a total of 81 theoretical conditions. However, because the device records unpolarized, co-polarized, and cross-polarized conditions simultaneously, the effective number of testing samples is reduced to 27. 
+
+### Experiment 1 Variables
+- skin tones: fair, medium, dark
+- flow speeds: slow (60 BPM), intermediate (90 BPM), fast (120 BPM)
+- vessel depths: 2.5 mm, 3.5 mm, 5 mm
+- polarization conditions recorded simultaneously
+
+### Experiment 2 Variables
+- phantom wavelengths: 525 nm, 660 nm, 940 nm
+- fixed vessel depth: 3.5 mm
+- fixed speed: intermediate, 90 BPM
+- multilayered phantom
+- polarization conditions recorded and compared
+
+### Experiment 3 Variables
+- 940 nm condition
+- pulse oximeter orientation rotated to 0 degrees, 90 degrees, and 180 degrees
+- original polarization and unpolarized conditions compared under rotation testing
+
+---
+
+## Limitations
+
+We recognize that the phantom cell model cannot fully replicate the complexity of human anatomy or physiological variability. However, demonstrating that the device can generate and detect PPG signals within this controlled system provides valuable insight into its fundamental capabilities and potential limitations. The results from this model will help identify areas where the device performs reliably and where further refinement may be needed before proceeding to human testing.
+
+---
+
+## Experimental Workflow
+
+### Day 1: Calibration
+The first day focused on calibrating the device to the phantom and familiarizing the Ramella Lab with the system. During calibration, it was observed that when the polarizers were placed on the top row, the channels were often very close to the noise floor, making the synthetic PPG signal more difficult to detect. Data were collected for fair and medium skin tone phantoms, and some files were repeated. 
+
+### Day 2: Experiment 1
+The second day focused on structured data collection across skin tone, vessel depth, and flow speed conditions. During this phase, the team also began investigating the effect of polarization by comparing signal quality with and without polarizers. This was motivated by the observation that channel 18 consistently produced a stronger signal even when the polarization was flipped. To improve repeatability, the Ramella Lab printed custom clamps to better regulate contact pressure during measurements. 
+
+### Day 3: Experiment 2
+The third day focused on wavelength-based experiments using multilayered phantoms with a fixed vessel depth of 3.5 mm and an intermediate speed of 90 BPM. Measurements were collected without clamps at first, and although consistent data could still be obtained, it became clear that clamps were important for maintaining consistency across experiments. Additional testing was also performed to investigate whether an offset was present in the data by turning off the photodiodes and LEDs to see whether the channels would properly zero out. Polarization was switched again to investigate whether signal behavior was tied to polarization condition or to channel-specific dependence. 
+
+### Day 4: Experiment 2 and Experiment 3
+The fourth day continued wavelength testing under more controlled conditions using clamps. These experiments again used multilayered phantoms, a vessel depth of 3.5 mm, and an intermediate speed of 90 BPM. Additional trials were performed to test both flipped polarization and device rotation, especially for the 940 nm channel. Rotation testing was conducted at 0 degrees, 90 degrees, and 180 degrees for fair and dark skin tone conditions.
 ---
 
 ## Channel Map
