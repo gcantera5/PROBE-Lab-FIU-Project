@@ -73,13 +73,15 @@ The fourth day continued wavelength testing under more controlled conditions usi
 ---
 
 ## Channel Map
-
+```python
 CHANNEL_MAP = {
     "Unpolarized_A": {"Green": "c5",  "Red": "c2",  "IR": "c4"},
     "Unpolarized_B": {"Green": "c11", "Red": "c8",  "IR": "c10"},
     "Co-Polarized":  {"Green": "c13", "Red": "c12", "IR": "c15"},
     "Cross-Polarized": {"Green": "c19", "Red": "c18", "IR": "c21"},
 }
+```
+
 
 ## Explanation of Signal Processing Pipeline
 
