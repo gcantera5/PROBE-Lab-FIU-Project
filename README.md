@@ -1,7 +1,5 @@
 # FIU Pulse Oximetry Analysis Pipeline
 
-# FIU Pulse Oximetry Analysis Pipeline
-
 The objective of this study is to evaluate how physiological parameters and polarization conditions, including unpolarized, co polarized, and cross polarized light, affect the perfusion index and overall signal quality measured by our device. Using a controlled phantom setup allows us to systematically vary factors such as skin color, optical depth, and flow speed while minimizing the variability typically seen in human testing. This approach makes it possible to isolate the effect of each parameter on PPG detection and to assess the device’s limitations under different optical and physical conditions. By analyzing performance across skin tones and depths, we aim to identify which polarization state provides the most reliable and consistent PPG measurements. Together, these investigations will validate the device’s detection capabilities and guide improvements for future human testing.
 
 ---
