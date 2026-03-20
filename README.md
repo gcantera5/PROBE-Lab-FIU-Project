@@ -69,6 +69,7 @@ The third day focused on wavelength-based experiments using multilayered phantom
 
 ### Day 4: Experiment 2 and Experiment 3
 The fourth day continued wavelength testing under more controlled conditions using clamps. These experiments again used multilayered phantoms, a vessel depth of 3.5 mm, and an intermediate speed of 90 BPM. Additional trials were performed to test both flipped polarization and device rotation, especially for the 940 nm channel. Rotation testing was conducted at 0 degrees, 90 degrees, and 180 degrees for fair and dark skin tone conditions.
+
 ---
 
 ## Channel Map
