@@ -693,13 +693,13 @@ for json_path in json_files:
         load_and_clean_json(json_path, condition_info)
 
 # ---------------------------------
-# Day 2 experiment
+# Experiment 1 (Day 1) Completed
 # ---------------------------------
 
-day2_root = "Experiment 1 Complete  copy"
-day2_folders = [d for d in glob.glob(os.path.join(day2_root, "*")) if os.path.isdir(d)]
+day1_completed_root = "Experiment 1 Complete  copy"
+day1_completed_folders = [d for d in glob.glob(os.path.join(day1_completed_root, "*")) if os.path.isdir(d)]
 
-for folder in day2_folders:
+for folder in day1_completed_folders:
 
     folder_name = os.path.basename(folder)
     parts = folder_name.split()
@@ -709,14 +709,13 @@ for folder in day2_folders:
     speed = parts[2]
 
     condition_info = {
-        "Day": "Day_2",
+        "Day": "Day_1",
         "SkinTone": skin.capitalize(),
         "Speed": speed.capitalize(),
         "Depth": depth,
         "Experiment": "Experiment_2"
     }
 
-    # unzip_file() will make sure it's only unzipped once.
     json_files = glob.glob(os.path.join(folder, "*.json*"))
     for json_path in json_files:
         load_and_clean_json(json_path, condition_info)

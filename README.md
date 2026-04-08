@@ -82,7 +82,6 @@ CHANNEL_MAP = {
 }
 ```
 
-
 ## Explanation of Signal Processing Pipeline
 
 ## Overview
