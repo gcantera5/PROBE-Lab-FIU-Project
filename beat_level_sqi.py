@@ -57,10 +57,10 @@ class BeatSQIConfig:
 
     # SQI thresholds
     sqi_lambda: float = 25.0
-    min_template_sqi: float = 0.20
+    min_template_sqi: float = 0.05
     min_corr: float = 0.80
     max_mad: float = 0.60
-    min_clipping_sqi: float = 0.95
+    min_clipping_sqi: float = 0.80
 
     # Window rejection
     window_seconds: int = 10
@@ -371,19 +371,42 @@ def compute_beat_features(raw_beat, norm_beat, template, start_idx, end_idx, bea
     }
 
 
+# def classify_beat(row, config):
+#     """
+#     First-pass rule-based beat rejection.
+#     These thresholds can be tuned after visual inspection.
+#     """
+#     is_bad = (
+#         row["template_sqi"] < config.min_template_sqi
+#         or row["correlation"] < config.min_corr
+#         or row["MAD"] > config.max_mad
+#         or row["clipping_sqi"] < config.min_clipping_sqi
+#     )
+
+#     return "bad" if is_bad else "good"
+
 def classify_beat(row, config):
     """
     First-pass rule-based beat rejection.
-    These thresholds can be tuned after visual inspection.
+    Also records why a beat was rejected.
     """
-    is_bad = (
-        row["template_sqi"] < config.min_template_sqi
-        or row["correlation"] < config.min_corr
-        or row["MAD"] > config.max_mad
-        or row["clipping_sqi"] < config.min_clipping_sqi
-    )
+    reasons = []
 
-    return "bad" if is_bad else "good"
+    if row["template_sqi"] < config.min_template_sqi:
+        reasons.append("low_template_sqi")
+
+    if row["correlation"] < config.min_corr:
+        reasons.append("low_correlation")
+
+    if row["MAD"] > config.max_mad:
+        reasons.append("high_MAD")
+
+    if row["clipping_sqi"] < config.min_clipping_sqi:
+        reasons.append("clipping")
+
+    label = "bad" if reasons else "good"
+
+    return label, ",".join(reasons)
 
 
 # ============================================================
@@ -423,7 +446,10 @@ def run_beat_level_sqi(ppg, config=None):
             config=config
         )
 
-        row["beat_label"] = classify_beat(row, config)
+        #row["beat_label"] = classify_beat(row, config)
+        label, reasons = classify_beat(row, config)
+        row["beat_label"] = label
+        row["rejection_reasons"] = reasons
         row["used_for_template"] = beat_number in set(template_indices.tolist())
 
         rows.append(row)
