@@ -5,6 +5,7 @@ import gzip
 import shutil
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
+import matplotlib.pyplot as plt
 
 import numpy as np
 import pandas as pd
@@ -562,6 +563,25 @@ def run_sqi_over_windows(signal, condition_info, channel_label, config=None):
 
     return window_df, beat_df
 
+def parse_day4_folder(folder_name):
+    """
+    Day 4 folder examples:
+        Green Dark 0 Og. Pol
+        Red Fair 0 Flip. Pol
+        IR Dark 90 Un. Pol
+        IR Fair 180 Og. Pol
+    """
+    parts = folder_name.split()
+
+    if len(parts) < 4:
+        raise ValueError(f"Could not parse Day 4 folder name: {folder_name}")
+
+    wavelength = parts[0]
+    skin = parts[1].capitalize()
+    orientation = parts[2]
+    pol = " ".join(parts[3:])
+
+    return wavelength, skin, orientation, pol
 
 # ============================================================
 # EXPERIMENT 1 PROCESSING
@@ -590,6 +610,7 @@ def process_experiment1_complete(
         d for d in glob.glob(os.path.join(experiment_root, "*"))
         if os.path.isdir(d)
     ]
+    
 
     for folder in condition_folders:
         folder_name = os.path.basename(folder)
@@ -688,6 +709,276 @@ def process_experiment1_complete(
         final_beat_df.to_csv(beat_path, index=False)
         print(f"Saved beat-level SQI results to: {beat_path}")
 
+def process_day4_experiments(
+    day4_root="Experiment 2 & 3 (Day 4) copy",
+    output_root="FIU_Beat_Level_SQI/Day_4"
+):
+    """
+    Process Day 4 heartbeat/SQI data following the experiment handout.
+
+    Day 4:
+        Experiment 2 = wavelength / skin tone / polarization condition
+        Experiment 3 = IR orientation / skin tone / polarization condition
+
+    All Day 4 data:
+        Depth = 3.5 mm
+        Speed = Intermediate / 90 BPM
+        Clamps = Yes
+        Phantom = Multilayered
+    """
+    # -------------------------------
+    # DEBUG: Verify folder structure
+    # -------------------------------
+
+    print("\nCurrent working directory:")
+    print(os.getcwd())
+
+    print("\nDoes Day 4 root exist?")
+    print(os.path.exists(day4_root))
+
+    print("\nContents of Day 4 root:")
+    for item in os.listdir(day4_root):
+        print(repr(item))
+
+    config = BeatSQIConfig()
+    os.makedirs(output_root, exist_ok=True)
+
+    all_window_results = []
+    all_beat_results = []
+
+    for exp_label in ["Experiment 2", "Experiment 3"]:
+
+        exp_path = os.path.join(day4_root, exp_label)
+
+        if not os.path.exists(exp_path):
+            print(f"Skipping missing folder: {exp_path}")
+            continue
+
+        condition_folders = [
+            d for d in glob.glob(os.path.join(exp_path, "*"))
+            if os.path.isdir(d)
+        ]
+
+        for folder in condition_folders:
+
+            folder_name = os.path.basename(folder)
+
+            try:
+                wavelength, skin, orientation, pol = parse_day4_folder(folder_name)
+            except Exception as e:
+                print(e)
+                continue
+
+            condition_info = {
+                "Day": "Day_4",
+                "Experiment": exp_label.replace(" ", "_"),
+                "Wavelength": wavelength,
+                "SkinTone": skin,
+                "Orientation": orientation,
+                "Pol": pol,
+                "Depth": "3.5mm",
+                "Speed": "Intermediate",
+                "ExpectedBPM": 90,
+                "Clamp": "Yes",
+                "PhantomType": "Multilayered",
+                "ConditionFolder": folder_name,
+            }
+
+            # --------------------------------------------------
+            # STEP 1: unzip .json.gz files if needed
+            # --------------------------------------------------
+            gz_files = glob.glob(os.path.join(folder, "*.json.gz"))
+
+            for gz_file in gz_files:
+                unzip_file(gz_file)
+
+            # --------------------------------------------------
+            # STEP 2: process ONLY unzipped .json files
+            # --------------------------------------------------
+            json_files = glob.glob(os.path.join(folder, "*.json"))
+
+            for json_path in json_files:
+
+                print(
+                    f"\nProcessing: {exp_label} / "
+                    f"{folder_name} / {os.path.basename(json_path)}"
+                )
+
+                try:
+                    cleaned_df = load_fiu_json(json_path, condition_info)
+                except Exception as e:
+                    print(f"Could not load {json_path}: {e}")
+                    continue
+
+                for col in cleaned_df.columns:
+
+                    if not any(pol_key in col for pol_key in CHANNEL_MAP.keys()):
+                        continue
+
+                    signal = cleaned_df[col].values
+
+                    try:
+                        window_df, beat_df = run_sqi_over_windows(
+                            signal=signal,
+                            condition_info=condition_info,
+                            channel_label=col,
+                            config=config
+                        )
+
+                        if len(window_df) > 0:
+                            print("\n--------------------------------")
+                            print(f"Experiment: {exp_label}")
+                            print(f"Condition: {folder_name}")
+                            print(f"Channel: {col}")
+                            print(f"Mean DTW: {window_df['mean_dtw_distance'].mean():.4f}")
+                            print(f"Mean Correlation: {window_df['mean_correlation'].mean():.4f}")
+                            print(f"Mean MAD: {window_df['mean_MAD'].mean():.4f}")
+
+                            good_windows = (
+                                window_df["window_label"] == "good_window"
+                            ).sum()
+                            total_windows = len(window_df)
+
+                            print(f"Good Windows: {good_windows}/{total_windows}")
+                            print("--------------------------------")
+
+                    except Exception as e:
+                        print(f"SQI failed for {col}: {e}")
+                        continue
+
+                    if len(window_df) > 0:
+                        window_df["SourceFile"] = os.path.basename(json_path)
+                        all_window_results.append(window_df)
+
+                    if len(beat_df) > 0:
+                        beat_df["SourceFile"] = os.path.basename(json_path)
+                        all_beat_results.append(beat_df)
+
+    if all_window_results:
+        final_window_df = pd.concat(all_window_results, ignore_index=True)
+        window_path = os.path.join(output_root, "day4_all_window_sqi.csv")
+        final_window_df.to_csv(window_path, index=False)
+        print(f"\nSaved Day 4 window-level SQI results to: {window_path}")
+
+    if all_beat_results:
+        final_beat_df = pd.concat(all_beat_results, ignore_index=True)
+        beat_path = os.path.join(output_root, "day4_all_beat_sqi.csv")
+        final_beat_df.to_csv(beat_path, index=False)
+        print(f"Saved Day 4 beat-level SQI results to: {beat_path}")
+
+# --------------------------------------------------
+# Visual test for day 1 analysis
+# --------------------------------------------------
+
+def debug_one_file_one_channel(
+    json_path,
+    condition_info,
+    channel_label="Cross-Polarized_IR",
+):
+    """
+    Debug one recording and one channel so we can visually check:
+    1. detected valleys
+    2. normalized beats + template
+    3. good/bad beat labels
+    """
+    config = BeatSQIConfig()
+
+    cleaned_df = load_fiu_json(json_path, condition_info)
+
+    if channel_label not in cleaned_df.columns:
+        print(f"{channel_label} not found.")
+        print("Available columns:")
+        print(cleaned_df.columns.tolist())
+        return
+
+    signal = cleaned_df[channel_label].values
+
+    result = run_beat_level_sqi(signal, config=config)
+
+    if result is None:
+        print("No result. Not enough beats were detected.")
+        return
+
+    filtered = result["filtered_signal"]
+    feature_table = result["feature_table"]
+    norm_beats = result["normalized_beats"]
+    template = result["template"]
+
+    print("\n===== DEBUG SUMMARY =====")
+    print(f"Channel: {channel_label}")
+    print(result["summary"])
+    print(feature_table[[
+        "beat_number",
+        "dtw_distance",
+        "correlation",
+        "MAD",
+        "template_sqi",
+        "clipping_sqi",
+        "beat_label",
+        "rejection_reasons"
+    ]])
+
+    # Plot 1: filtered PPG with detected valleys
+    t = np.arange(len(filtered)) / config.fs
+    valley_idxs = feature_table["beat_start_idx"].values.astype(int)
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(t, filtered, linewidth=1.2)
+    plt.scatter(
+        valley_idxs / config.fs,
+        filtered[valley_idxs],
+        marker="v",
+        s=50,
+        label="Detected valleys"
+    )
+    plt.title(f"{channel_label}: Filtered PPG with Detected Valleys")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Filtered PPG")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    plt.show()
+
+    # Plot 2: normalized beats + template
+    plt.figure(figsize=(8, 4))
+    for beat in norm_beats:
+        plt.plot(beat, alpha=0.25, linewidth=1)
+
+    plt.plot(template, linewidth=3, label="Template beat")
+    plt.title(f"{channel_label}: Normalized Beats + Template")
+    plt.xlabel("Normalized sample")
+    plt.ylabel("Normalized amplitude")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    plt.show()
+
+    # Plot 3: good/bad beat intervals
+    plt.figure(figsize=(10, 4))
+    plt.plot(t, filtered, linewidth=1.2, color="black")
+
+    for _, row in feature_table.iterrows():
+        start = row["beat_start_idx"] / config.fs
+        end = row["beat_end_idx"] / config.fs
+
+        if row["beat_label"] == "good":
+            plt.axvspan(start, end, color="green", alpha=0.18)
+        else:
+            plt.axvspan(start, end, color="red", alpha=0.30)
+
+    plt.title(f"{channel_label}: Good vs Bad Beat Intervals")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Filtered PPG")
+    plt.grid(True, linestyle="--", alpha=0.4)
+
+    # fake legend handles
+    plt.plot([], [], color="green", linewidth=8, alpha=0.4, label="Good beat")
+    plt.plot([], [], color="red", linewidth=8, alpha=0.4, label="Bad beat")
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
+
 
 # ============================================================
 # MAIN BLOCK
@@ -695,10 +986,35 @@ def process_experiment1_complete(
 
 if __name__ == "__main__":
 
-    # Change this if your folder name/path is different
-    EXPERIMENT_1_FOLDER = "Experiment 1 Complete  copy"
-
-    process_experiment1_complete(
-        experiment_root=EXPERIMENT_1_FOLDER,
-        output_root="FIU_Beat_Level_SQI/Experiment_1"
+    process_day4_experiments(
+        day4_root="Experiment 2 & 3 (Day 4) copy",
+        output_root="FIU_Beat_Level_SQI/Day_4"
     )
+
+# if __name__ == "__main__":
+
+#     EXPERIMENT_1_FOLDER = "Experiment 1 Complete  copy"
+
+#     process_experiment1_complete(
+#         experiment_root=EXPERIMENT_1_FOLDER,
+#         output_root="FIU_Beat_Level_SQI/Experiment_1"
+#     )
+
+# if __name__ == "__main__":
+
+#     test_json = "Experiment 1 Complete  copy/3.75 Fair Intermediate/2025-10-23T01-37-59-8516317d-a527-4f06-baaf-87ac9ffde0e7.json"
+
+#     condition_info = {
+#         "Day": "Day_1",
+#         "SkinTone": "Fair",
+#         "Speed": "Intermediate",
+#         "Depth": "3.75mm",
+#         "Experiment": "Experiment_2",
+#         "ConditionFolder": "3.75 Fair Intermediate",
+#     }
+
+#     debug_one_file_one_channel(
+#         json_path=test_json,
+#         condition_info=condition_info,
+#         channel_label="Cross-Polarized_IR"
+#     )
