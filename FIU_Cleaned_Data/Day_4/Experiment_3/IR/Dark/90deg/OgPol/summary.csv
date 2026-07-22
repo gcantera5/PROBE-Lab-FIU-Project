@@ -1,13 +1,3 @@
-Participant,Channel,Hardware Channel,Metric,Mean,Std,Day,Experiment,Wavelength,SkinTone,Orientation,Pol
-IR_Dark_90_OgPol,Unpolarized_A_Green,C5,PI,-251.38867720983902,82.19278297258083,Day_4,Experiment_3,IR,Dark,90,Og. Pol
-IR_Dark_90_OgPol,Unpolarized_A_Red,C2,PI,-220.94561870241512,36.140742223146574,Day_4,Experiment_3,IR,Dark,90,Og. Pol
-IR_Dark_90_OgPol,Unpolarized_A_IR,C4,PI,-229.29838988220126,54.674460239615264,Day_4,Experiment_3,IR,Dark,90,Og. Pol
-IR_Dark_90_OgPol,Unpolarized_B_Green,C11,PI,-213.3085032778062,87.05404549372916,Day_4,Experiment_3,IR,Dark,90,Og. Pol
-IR_Dark_90_OgPol,Unpolarized_B_Red,C8,PI,-230.5068646179627,34.3811857451877,Day_4,Experiment_3,IR,Dark,90,Og. Pol
-IR_Dark_90_OgPol,Unpolarized_B_IR,C10,PI,-204.24055082180556,38.40396213330367,Day_4,Experiment_3,IR,Dark,90,Og. Pol
-IR_Dark_90_OgPol,Co-Polarized_Green,C13,PI,-206.9354778444558,44.11003800815717,Day_4,Experiment_3,IR,Dark,90,Og. Pol
-IR_Dark_90_OgPol,Co-Polarized_Red,C12,PI,-202.5213995151941,27.350034585270624,Day_4,Experiment_3,IR,Dark,90,Og. Pol
-IR_Dark_90_OgPol,Co-Polarized_IR,C15,PI,-201.1252732497545,37.44508144600075,Day_4,Experiment_3,IR,Dark,90,Og. Pol
-IR_Dark_90_OgPol,Cross-Polarized_Green,C19,PI,-207.52543626671837,53.956754083758774,Day_4,Experiment_3,IR,Dark,90,Og. Pol
-IR_Dark_90_OgPol,Cross-Polarized_Red,C18,PI,-202.24474836900134,27.728178234327387,Day_4,Experiment_3,IR,Dark,90,Og. Pol
-IR_Dark_90_OgPol,Cross-Polarized_IR,C21,PI,-202.22462717074242,27.885023494718965,Day_4,Experiment_3,IR,Dark,90,Og. Pol
+version https://git-lfs.github.com/spec/v1
+oid sha256:f70f35622607a7cb3cf1d75056ed4c6438ce63c4ca9a4e4f7607ece2c66c60d8
+size 1523

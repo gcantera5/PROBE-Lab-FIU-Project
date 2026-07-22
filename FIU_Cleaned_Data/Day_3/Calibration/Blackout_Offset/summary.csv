@@ -1,13 +1,3 @@
-Participant,Channel,Hardware Channel,Metric,Mean,Std,Day,Condition
-Blackout_Offset,Unpolarized_A_Green,C5,Baseline,316.4024008350731,2321.556112004234,Day_3,Blackout_Offset
-Blackout_Offset,Unpolarized_A_Red,C2,Baseline,931.6090814196242,2436.4544688993933,Day_3,Blackout_Offset
-Blackout_Offset,Unpolarized_A_IR,C4,Baseline,1110.9618997912316,839.5957000672041,Day_3,Blackout_Offset
-Blackout_Offset,Unpolarized_B_Green,C11,Baseline,590.1993736951983,2734.096097177431,Day_3,Blackout_Offset
-Blackout_Offset,Unpolarized_B_Red,C8,Baseline,986.7969728601253,1802.2490411936774,Day_3,Blackout_Offset
-Blackout_Offset,Unpolarized_B_IR,C10,Baseline,1217.867954070981,2194.0552569522256,Day_3,Blackout_Offset
-Blackout_Offset,Co-Polarized_Green,C13,Baseline,4975.978601252609,8088.149453136017,Day_3,Blackout_Offset
-Blackout_Offset,Co-Polarized_Red,C12,Baseline,4175.562108559499,7243.7972147570845,Day_3,Blackout_Offset
-Blackout_Offset,Co-Polarized_IR,C15,Baseline,5449.055323590815,10605.088417425239,Day_3,Blackout_Offset
-Blackout_Offset,Cross-Polarized_Green,C19,Baseline,3972.3893528183717,16239.336546083523,Day_3,Blackout_Offset
-Blackout_Offset,Cross-Polarized_Red,C18,Baseline,5240.763048016702,25928.62235263666,Day_3,Blackout_Offset
-Blackout_Offset,Cross-Polarized_IR,C21,Baseline,8024.6753653444675,26730.001361114366,Day_3,Blackout_Offset
+version https://git-lfs.github.com/spec/v1
+oid sha256:67824d23ecd227b7e5729d9fda33602b41d0d3536d9e79d3b9428c8d720508fe
+size 1340

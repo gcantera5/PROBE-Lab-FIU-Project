@@ -31,6 +31,12 @@ CHANNEL_MAP = {
     "Cross-Polarized": {"Green": "c19", "Red": "c18", "IR": "c21"},
 }
 
+WAVELENGTH_NM = {
+    "Green": 525,
+    "Red": 660,
+    "IR": 940,
+}
+
 
 @dataclass
 class BeatSQIConfig:
@@ -583,13 +589,33 @@ def parse_day4_folder(folder_name):
 
     return wavelength, skin, orientation, pol
 
+def parse_day3_folder(folder_name):
+    """
+    Day 3 heartbeat folder examples:
+        Green Dark
+        Green Light
+        Red Dark
+        Red Light
+    """
+    parts = folder_name.split()
+
+    if len(parts) != 2:
+        raise ValueError(
+            f"Could not parse Day 3 folder name: {folder_name}"
+        )
+
+    wavelength = parts[0].capitalize()
+    skin = parts[1].capitalize()
+
+    return wavelength, skin
+
 # ============================================================
-# EXPERIMENT 1 PROCESSING
+# DAY 2: EXPERIMENT 1 PROCESSING
 # ============================================================
 
 def process_experiment1_complete(
     experiment_root="Experiment 1 Complete  copy",
-    output_root="FIU_Beat_Level_SQI/Experiment_1"
+    output_root="FIU_Beat_Level_SQI/Day_2/Experiment_1"
 ):
     """
     Process Experiment 1 folder structure:
@@ -605,6 +631,8 @@ def process_experiment1_complete(
 
     all_window_results = []
     all_beat_results = []
+    all_summary_results = []
+
 
     condition_folders = [
         d for d in glob.glob(os.path.join(experiment_root, "*"))
@@ -625,11 +653,18 @@ def process_experiment1_complete(
         speed = parts[2].capitalize()
 
         condition_info = {
-            "Day": "Day_1",
+            "Day": "Day_2",
+            "Experiment": "Experiment_1",
             "SkinTone": skin,
             "Speed": speed,
             "Depth": depth,
-            "Experiment": "Experiment_2",
+            "ExpectedBPM": {
+                "Slow": 60,
+                "Intermediate": 90,
+                "Fast": 120
+            }.get(speed),
+            "Clamp": "Yes",
+            "PolarizationPlacement": "Same",
             "ConditionFolder": folder_name,
         }
 
@@ -646,9 +681,10 @@ def process_experiment1_complete(
         # STEP 2: ONLY process .json files
         # --------------------------------------------------
 
-        json_files = glob.glob(os.path.join(folder, "*.json"))
+        json_files = sorted(glob.glob(os.path.join(folder, "*.json")))
 
-        for json_path in json_files:
+        for trial_number, json_path in enumerate( json_files, start=1):
+
 
             print(f"\nProcessing: {folder_name} / {os.path.basename(json_path)}")
 
@@ -682,8 +718,53 @@ def process_experiment1_complete(
                         good_windows = (window_df["window_label"] == "good_window").sum()
                         total_windows = len(window_df)
 
+                        good_window_fraction = (
+                            good_windows / total_windows
+                            if total_windows > 0
+                            else np.nan
+                        )
+
                         print(f"Good Windows: {good_windows}/{total_windows}")
                         print("--------------------------------")
+
+                        summary_row = {
+                            "Day": "Day_2",
+                            "Experiment": "Experiment_1",
+                            "ConditionFolder": folder_name,
+                            "Trial": trial_number,
+                            "SourceFile": os.path.basename(json_path),
+                            "Channel": col,
+                            "Hardware Channel": channel_name_map(col),
+                            "SkinTone": skin,
+                            "Speed": speed,
+                            "Depth": depth,
+                            "ExpectedBPM": {
+                                "Slow": 60,
+                                "Intermediate": 90,
+                                "Fast": 120
+                            }.get(speed),
+                            "Clamp": "Yes",
+                            "PolarizationPlacement": "Same",
+                            "GoodWindows": int(good_windows),
+                            "TotalWindows": int(total_windows),
+                            "GoodWindowFraction": float(
+                                good_window_fraction
+                            ),
+                            "MeanDTW": float(
+                                window_df["mean_dtw_distance"].mean()
+                            ),
+                            "MeanCorrelation": float(
+                                window_df["mean_correlation"].mean()
+                            ),
+                            "MeanMAD": float(
+                                window_df["mean_MAD"].mean()
+                            ),
+                            "MeanTemplateSQI": float(
+                                window_df["mean_template_sqi"].mean()
+                            ),
+                        }
+
+                        all_summary_results.append(summary_row)
                         
                 except Exception as e:
                     print(f"SQI failed for {col}: {e}")
@@ -691,23 +772,341 @@ def process_experiment1_complete(
 
                 if len(window_df) > 0:
                     window_df["SourceFile"] = os.path.basename(json_path)
+                    window_df["Trial"] = trial_number
                     all_window_results.append(window_df)
 
                 if len(beat_df) > 0:
                     beat_df["SourceFile"] = os.path.basename(json_path)
+                    beat_df["Trial"] = trial_number
                     all_beat_results.append(beat_df)
 
     if all_window_results:
         final_window_df = pd.concat(all_window_results, ignore_index=True)
-        window_path = os.path.join(output_root, "experiment_1_all_window_sqi.csv")
+        window_path = os.path.join(output_root, "day2_experiment1_all_window_sqi.csv")
         final_window_df.to_csv(window_path, index=False)
         print(f"\nSaved window-level SQI results to: {window_path}")
 
     if all_beat_results:
         final_beat_df = pd.concat(all_beat_results, ignore_index=True)
-        beat_path = os.path.join(output_root, "experiment_1_all_beat_sqi.csv")
+        beat_path = os.path.join(output_root, "day2_experiment1_all_beat_sqi.csv")
         final_beat_df.to_csv(beat_path, index=False)
         print(f"Saved beat-level SQI results to: {beat_path}")
+    
+    if all_summary_results:
+        summary_df = pd.DataFrame(all_summary_results)
+
+        summary_path = os.path.join(
+            output_root,
+            "day2_experiment1_recording_summary.csv"
+        )
+
+        summary_df.to_csv(
+            summary_path,
+            index=False
+        )
+
+        print(
+            f"Saved Day 2 Experiment 1 summary to: "
+            f"{summary_path}"
+        )
+
+# ============================================================
+# DAY 3: EXPERIMENT 2 HEARTBEAT PROCESSING
+# ============================================================
+
+def process_day3_experiment2(
+    day3_root=(
+        "Experiment 2 Test (Day 3) copy/"
+        "Multilayered, 90 BPM, No Clamps & OG Polarization"
+    ),
+    output_root="FIU_Beat_Level_SQI/Day_3/Experiment_2"
+):
+    """
+    Process the main Day 3 Experiment 2 pulsatile recordings.
+
+    Folder structure:
+        Multilayered, 90 BPM, No Clamps & OG Polarization
+            Green Dark
+            Green Light
+            Red Dark
+            Red Light
+
+    Fixed experimental conditions:
+        Depth = 3.5 mm
+        Speed = Intermediate
+        Expected BPM = 90
+        Clamp = No
+        Phantom = Multilayered
+        Polarization = Original
+    """
+    config = BeatSQIConfig()
+    os.makedirs(output_root, exist_ok=True)
+
+    all_window_results = []
+    all_beat_results = []
+    all_summary_results = []
+
+    if not os.path.exists(day3_root):
+        print(f"Day 3 heartbeat folder not found: {day3_root}")
+        return
+
+    condition_folders = sorted(
+        folder
+        for folder in glob.glob(os.path.join(day3_root, "*"))
+        if os.path.isdir(folder)
+    )
+
+    print(
+        f"\nFound {len(condition_folders)} "
+        f"Day 3 heartbeat condition folders."
+    )
+
+    for folder in condition_folders:
+        folder_name = os.path.basename(folder)
+
+        try:
+            wavelength, skin = parse_day3_folder(folder_name)
+        except ValueError as error:
+            print(error)
+            continue
+
+        condition_info = {
+            "Day": "Day_3",
+            "Experiment": "Experiment_2",
+            "ConditionFolder": folder_name,
+            "Wavelength": wavelength,
+            "WavelengthNm": WAVELENGTH_NM.get(wavelength),
+            "SkinTone": skin,
+            "Depth": "3.5mm",
+            "Speed": "Intermediate",
+            "ExpectedBPM": 90,
+            "Clamp": "No",
+            "PhantomType": "Multilayered",
+            "PolarizationCondition": "Original",
+        }
+
+        # --------------------------------------------------
+        # STEP 1: unzip compressed files if needed
+        # --------------------------------------------------
+        gz_files = sorted(
+            glob.glob(os.path.join(folder, "*.json.gz"))
+        )
+
+        for gz_file in gz_files:
+            unzip_file(gz_file)
+
+        # --------------------------------------------------
+        # STEP 2: process ONLY unzipped JSON files
+        # --------------------------------------------------
+        json_files = sorted(
+            glob.glob(os.path.join(folder, "*.json"))
+        )
+
+        print(
+            f"\n{folder_name}: found "
+            f"{len(json_files)} unzipped JSON files."
+        )
+
+        for trial_number, json_path in enumerate(
+            json_files,
+            start=1
+        ):
+            source_file = os.path.basename(json_path)
+
+            print(
+                f"\nProcessing Day 3 / Experiment 2 / "
+                f"{folder_name} / Trial {trial_number}"
+            )
+
+            try:
+                cleaned_df = load_fiu_json(
+                    json_path,
+                    condition_info
+                )
+            except Exception as error:
+                print(f"Could not load {json_path}: {error}")
+                continue
+
+            for col in cleaned_df.columns:
+                if not any(
+                    polarization in col
+                    for polarization in CHANNEL_MAP.keys()
+                ):
+                    continue
+
+                signal = cleaned_df[col].values
+
+                try:
+                    window_df, beat_df = run_sqi_over_windows(
+                        signal=signal,
+                        condition_info=condition_info,
+                        channel_label=col,
+                        config=config
+                    )
+                except Exception as error:
+                    print(f"SQI failed for {col}: {error}")
+                    continue
+
+                if len(window_df) == 0:
+                    print(
+                        f"No valid windows found for "
+                        f"{folder_name} / {col}"
+                    )
+                    continue
+
+                good_windows = (
+                    window_df["window_label"] == "good_window"
+                ).sum()
+
+                total_windows = len(window_df)
+
+                good_window_fraction = (
+                    good_windows / total_windows
+                    if total_windows > 0
+                    else np.nan
+                )
+
+                print("\n--------------------------------")
+                print("Day: Day 3")
+                print("Experiment: Experiment 2")
+                print(f"Condition: {folder_name}")
+                print(f"Trial: {trial_number}")
+                print(f"Channel: {col}")
+                print(
+                    "Mean DTW: "
+                    f"{window_df['mean_dtw_distance'].mean():.4f}"
+                )
+                print(
+                    "Mean Correlation: "
+                    f"{window_df['mean_correlation'].mean():.4f}"
+                )
+                print(
+                    "Mean MAD: "
+                    f"{window_df['mean_MAD'].mean():.4f}"
+                )
+                print(
+                    f"Good Windows: "
+                    f"{good_windows}/{total_windows}"
+                )
+                print("--------------------------------")
+
+                summary_row = {
+                    "Day": "Day_3",
+                    "Experiment": "Experiment_2",
+                    "ConditionFolder": folder_name,
+                    "Trial": trial_number,
+                    "SourceFile": source_file,
+                    "Channel": col,
+                    "Hardware Channel": channel_name_map(col),
+                    "Wavelength": wavelength,
+                    "WavelengthNm": WAVELENGTH_NM.get(wavelength),
+                    "SkinTone": skin,
+                    "Depth": "3.5mm",
+                    "Speed": "Intermediate",
+                    "ExpectedBPM": 90,
+                    "Clamp": "No",
+                    "PhantomType": "Multilayered",
+                    "PolarizationCondition": "Original",
+                    "GoodWindows": int(good_windows),
+                    "TotalWindows": int(total_windows),
+                    "GoodWindowFraction": float(
+                        good_window_fraction
+                    ),
+                    "MeanDTW": float(
+                        window_df["mean_dtw_distance"].mean()
+                    ),
+                    "MeanCorrelation": float(
+                        window_df["mean_correlation"].mean()
+                    ),
+                    "MeanMAD": float(
+                        window_df["mean_MAD"].mean()
+                    ),
+                    "MeanTemplateSQI": float(
+                        window_df["mean_template_sqi"].mean()
+                    ),
+                }
+
+                all_summary_results.append(summary_row)
+
+                window_df["SourceFile"] = source_file
+                window_df["Trial"] = trial_number
+                all_window_results.append(window_df)
+
+                if len(beat_df) > 0:
+                    beat_df["SourceFile"] = source_file
+                    beat_df["Trial"] = trial_number
+                    all_beat_results.append(beat_df)
+
+    # --------------------------------------------------
+    # SAVE WINDOW RESULTS
+    # --------------------------------------------------
+    if all_window_results:
+        final_window_df = pd.concat(
+            all_window_results,
+            ignore_index=True
+        )
+
+        window_path = os.path.join(
+            output_root,
+            "day3_experiment2_all_window_sqi.csv"
+        )
+
+        final_window_df.to_csv(
+            window_path,
+            index=False
+        )
+
+        print(
+            f"\nSaved Day 3 window results to: "
+            f"{window_path}"
+        )
+
+    # --------------------------------------------------
+    # SAVE BEAT RESULTS
+    # --------------------------------------------------
+    if all_beat_results:
+        final_beat_df = pd.concat(
+            all_beat_results,
+            ignore_index=True
+        )
+
+        beat_path = os.path.join(
+            output_root,
+            "day3_experiment2_all_beat_sqi.csv"
+        )
+
+        final_beat_df.to_csv(
+            beat_path,
+            index=False
+        )
+
+        print(
+            f"Saved Day 3 beat results to: "
+            f"{beat_path}"
+        )
+
+    # --------------------------------------------------
+    # SAVE RECORDING SUMMARY
+    # --------------------------------------------------
+    if all_summary_results:
+        summary_df = pd.DataFrame(all_summary_results)
+
+        summary_path = os.path.join(
+            output_root,
+            "day3_experiment2_recording_summary.csv"
+        )
+
+        summary_df.to_csv(
+            summary_path,
+            index=False
+        )
+
+        print(
+            f"Saved Day 3 recording summary to: "
+            f"{summary_path}"
+        )
+
+
 
 def process_day4_experiments(
     day4_root="Experiment 2 & 3 (Day 4) copy",
@@ -730,21 +1129,12 @@ def process_day4_experiments(
     # DEBUG: Verify folder structure
     # -------------------------------
 
-    print("\nCurrent working directory:")
-    print(os.getcwd())
-
-    print("\nDoes Day 4 root exist?")
-    print(os.path.exists(day4_root))
-
-    print("\nContents of Day 4 root:")
-    for item in os.listdir(day4_root):
-        print(repr(item))
-
     config = BeatSQIConfig()
     os.makedirs(output_root, exist_ok=True)
 
     all_window_results = []
     all_beat_results = []
+    all_summary_results = []
 
     for exp_label in ["Experiment 2", "Experiment 3"]:
 
@@ -773,9 +1163,10 @@ def process_day4_experiments(
                 "Day": "Day_4",
                 "Experiment": exp_label.replace(" ", "_"),
                 "Wavelength": wavelength,
+                "WavelengthNm": WAVELENGTH_NM.get(wavelength),
                 "SkinTone": skin,
-                "Orientation": orientation,
-                "Pol": pol,
+                "OrientationDegrees": int(orientation),
+                "PolarizationCondition": pol,
                 "Depth": "3.5mm",
                 "Speed": "Intermediate",
                 "ExpectedBPM": 90,
@@ -795,9 +1186,9 @@ def process_day4_experiments(
             # --------------------------------------------------
             # STEP 2: process ONLY unzipped .json files
             # --------------------------------------------------
-            json_files = glob.glob(os.path.join(folder, "*.json"))
+            json_files = sorted(glob.glob(os.path.join(folder, "*.json")))
 
-            for json_path in json_files:
+            for trial_number, json_path in enumerate(json_files, start=1):
 
                 print(
                     f"\nProcessing: {exp_label} / "
@@ -837,10 +1228,57 @@ def process_day4_experiments(
                             good_windows = (
                                 window_df["window_label"] == "good_window"
                             ).sum()
+
                             total_windows = len(window_df)
+                            
+                            good_window_fraction = (
+                                good_windows / total_windows
+                                if total_windows > 0
+                                else np.nan
+                            )
 
                             print(f"Good Windows: {good_windows}/{total_windows}")
                             print("--------------------------------")
+
+                            summary_row = {
+                                "Day": "Day_4",
+                                "Experiment": exp_label.replace(" ", "_"),
+                                "ConditionFolder": folder_name,
+                                "Trial": trial_number,
+                                "SourceFile": os.path.basename(json_path),
+                                "Channel": col,
+                                "Hardware Channel": channel_name_map(col),
+                                "Wavelength": wavelength,
+                                "WavelengthNm": WAVELENGTH_NM.get(wavelength),
+                                "SkinTone": skin,
+                                "OrientationDegrees": int(orientation),
+                                "PolarizationCondition": pol,
+                                "Depth": "3.5mm",
+                                "Speed": "Intermediate",
+                                "ExpectedBPM": 90,
+                                "Clamp": "Yes",
+                                "PhantomType": "Multilayered",
+                                "GoodWindows": int(good_windows),
+                                "TotalWindows": int(total_windows),
+                                "GoodWindowFraction": float(
+                                    good_window_fraction
+                                ),
+                                "MeanDTW": float(
+                                    window_df["mean_dtw_distance"].mean()
+                                ),
+                                "MeanCorrelation": float(
+                                    window_df["mean_correlation"].mean()
+                                ),
+                                "MeanMAD": float(
+                                    window_df["mean_MAD"].mean()
+                                ),
+                                "MeanTemplateSQI": float(
+                                    window_df["mean_template_sqi"].mean()
+                                ),
+                            }
+
+                            all_summary_results.append(summary_row)
+
 
                     except Exception as e:
                         print(f"SQI failed for {col}: {e}")
@@ -848,26 +1286,193 @@ def process_day4_experiments(
 
                     if len(window_df) > 0:
                         window_df["SourceFile"] = os.path.basename(json_path)
+                        window_df["Trial"] = trial_number
                         all_window_results.append(window_df)
 
                     if len(beat_df) > 0:
                         beat_df["SourceFile"] = os.path.basename(json_path)
+                        beat_df["Trial"] = trial_number
                         all_beat_results.append(beat_df)
 
-    if all_window_results:
-        final_window_df = pd.concat(all_window_results, ignore_index=True)
-        window_path = os.path.join(output_root, "day4_all_window_sqi.csv")
-        final_window_df.to_csv(window_path, index=False)
-        print(f"\nSaved Day 4 window-level SQI results to: {window_path}")
 
+    # --------------------------------------------------
+    # SAVE WINDOW-LEVEL RESULTS
+    # --------------------------------------------------
+    if all_window_results:
+        final_window_df = pd.concat(
+            all_window_results,
+            ignore_index=True
+        )
+
+        # Save one combined Day 4 file
+        window_path = os.path.join(
+            output_root,
+            "day4_all_window_sqi.csv"
+        )
+
+        final_window_df.to_csv(
+            window_path,
+            index=False
+        )
+
+        print(
+            f"\nSaved Day 4 window-level SQI results to: "
+            f"{window_path}"
+        )
+
+        # Save Experiment 2 and Experiment 3 separately
+        for experiment_name in ["Experiment_2", "Experiment_3"]:
+
+            experiment_window_df = final_window_df[
+                final_window_df["Experiment"] == experiment_name
+            ]
+
+            if len(experiment_window_df) > 0:
+
+                experiment_folder = os.path.join(
+                    output_root,
+                    experiment_name
+                )
+
+                os.makedirs(
+                    experiment_folder,
+                    exist_ok=True
+                )
+
+                experiment_window_path = os.path.join(
+                    experiment_folder,
+                    f"day4_{experiment_name.lower()}_window_sqi.csv"
+                )
+
+                experiment_window_df.to_csv(
+                    experiment_window_path,
+                    index=False
+                )
+
+                print(
+                    f"Saved {experiment_name} window results to: "
+                    f"{experiment_window_path}"
+                )
+
+    # --------------------------------------------------
+    # SAVE BEAT-LEVEL RESULTS
+    # --------------------------------------------------
     if all_beat_results:
-        final_beat_df = pd.concat(all_beat_results, ignore_index=True)
-        beat_path = os.path.join(output_root, "day4_all_beat_sqi.csv")
-        final_beat_df.to_csv(beat_path, index=False)
-        print(f"Saved Day 4 beat-level SQI results to: {beat_path}")
+        final_beat_df = pd.concat(
+            all_beat_results,
+            ignore_index=True
+        )
+
+        # Save one combined Day 4 file
+        beat_path = os.path.join(
+            output_root,
+            "day4_all_beat_sqi.csv"
+        )
+
+        final_beat_df.to_csv(
+            beat_path,
+            index=False
+        )
+
+        print(
+            f"Saved Day 4 beat-level SQI results to: "
+            f"{beat_path}"
+        )
+
+        # Save Experiment 2 and Experiment 3 separately
+        for experiment_name in ["Experiment_2", "Experiment_3"]:
+
+            experiment_beat_df = final_beat_df[
+                final_beat_df["Experiment"] == experiment_name
+            ]
+
+            if len(experiment_beat_df) > 0:
+
+                experiment_folder = os.path.join(
+                    output_root,
+                    experiment_name
+                )
+
+                os.makedirs(
+                    experiment_folder,
+                    exist_ok=True
+                )
+
+                experiment_beat_path = os.path.join(
+                    experiment_folder,
+                    f"day4_{experiment_name.lower()}_beat_sqi.csv"
+                )
+
+                experiment_beat_df.to_csv(
+                    experiment_beat_path,
+                    index=False
+                )
+
+                print(
+                    f"Saved {experiment_name} beat results to: "
+                    f"{experiment_beat_path}"
+                )
+
+    # --------------------------------------------------
+    # SAVE RECORDING SUMMARY RESULTS
+    # --------------------------------------------------
+    if all_summary_results:
+        summary_df = pd.DataFrame(all_summary_results)
+
+        summary_path = os.path.join(
+            output_root,
+            "day4_recording_summary.csv"
+        )
+
+        summary_df.to_csv(
+            summary_path,
+            index=False
+        )
+
+        print(
+            f"Saved Day 4 recording summary to: "
+            f"{summary_path}"
+        )
+
+        # --------------------------------------------------
+        # SAVE EXPERIMENT-SPECIFIC SUMMARIES
+        # --------------------------------------------------
+
+        for experiment_name in ["Experiment_2", "Experiment_3"]:
+
+            experiment_summary_df = summary_df[
+                summary_df["Experiment"] == experiment_name
+            ]
+
+            if len(experiment_summary_df) > 0:
+
+                experiment_folder = os.path.join(
+                    output_root,
+                    experiment_name
+                )
+
+                os.makedirs(
+                    experiment_folder,
+                    exist_ok=True
+                )
+
+                summary_file = os.path.join(
+                    experiment_folder,
+                    f"{experiment_name.lower()}_summary.csv"
+                )
+
+                experiment_summary_df.to_csv(
+                    summary_file,
+                    index=False
+                )
+
+                print(
+                    f"Saved {experiment_name} summary to: "
+                    f"{summary_file}"
+                )
 
 # --------------------------------------------------
-# Visual test for day 1 analysis
+# Visual test for Day 2 Experiment 1
 # --------------------------------------------------
 
 def debug_one_file_one_channel(
@@ -986,32 +1591,57 @@ def debug_one_file_one_channel(
 
 if __name__ == "__main__":
 
+    # ------------------------------------------
+    # Day 2: Experiment 1
+    # ------------------------------------------
+    process_experiment1_complete(
+        experiment_root="Experiment 1 Complete  copy",
+        output_root="FIU_Beat_Level_SQI/Day_2/Experiment_1"
+    )
+
+    # ------------------------------------------
+    # Day 3: Experiment 2 heartbeat recordings
+    # ------------------------------------------
+    process_day3_experiment2(
+        day3_root=(
+            "Experiment 2 Test (Day 3) copy/"
+            "Multilayered, 90 BPM, No Clamps & OG Polarization"
+        ),
+        output_root="FIU_Beat_Level_SQI/Day_3/Experiment_2"
+    )
+
+    # ------------------------------------------
+    # Day 4: Experiments 2 and 3
+    # ------------------------------------------
     process_day4_experiments(
         day4_root="Experiment 2 & 3 (Day 4) copy",
         output_root="FIU_Beat_Level_SQI/Day_4"
     )
 
 # if __name__ == "__main__":
-
+#
 #     EXPERIMENT_1_FOLDER = "Experiment 1 Complete  copy"
-
+#
 #     process_experiment1_complete(
 #         experiment_root=EXPERIMENT_1_FOLDER,
-#         output_root="FIU_Beat_Level_SQI/Experiment_1"
+#         output_root="FIU_Beat_Level_SQI/Day_2/Experiment_1"
 #     )
 
 # if __name__ == "__main__":
 
 #     test_json = "Experiment 1 Complete  copy/3.75 Fair Intermediate/2025-10-23T01-37-59-8516317d-a527-4f06-baaf-87ac9ffde0e7.json"
 
-#     condition_info = {
-#         "Day": "Day_1",
-#         "SkinTone": "Fair",
-#         "Speed": "Intermediate",
-#         "Depth": "3.75mm",
-#         "Experiment": "Experiment_2",
-#         "ConditionFolder": "3.75 Fair Intermediate",
-#     }
+    # condition_info = {
+    #     "Day": "Day_2",
+    #     "Experiment": "Experiment_1",
+    #     "SkinTone": "Fair",
+    #     "Speed": "Intermediate",
+    #     "Depth": "3.75mm",
+    #     "ExpectedBPM": 90,
+    #     "Clamp": "Yes",
+    #     "PolarizationPlacement": "Same",
+    #     "ConditionFolder": "3.75 Fair Intermediate",
+    # }
 
 #     debug_one_file_one_channel(
 #         json_path=test_json,

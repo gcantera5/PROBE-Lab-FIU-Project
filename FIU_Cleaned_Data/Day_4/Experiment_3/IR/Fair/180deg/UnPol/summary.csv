@@ -1,13 +1,3 @@
-Participant,Channel,Hardware Channel,Metric,Mean,Std,Day,Experiment,Wavelength,SkinTone,Orientation,Pol
-IR_Fair_180_UnPol,Unpolarized_A_Green,C5,PI,-220.95688289285562,47.45450708341163,Day_4,Experiment_3,IR,Fair,180,Un. Pol
-IR_Fair_180_UnPol,Unpolarized_A_Red,C2,PI,-233.4370334232506,136.16556125378077,Day_4,Experiment_3,IR,Fair,180,Un. Pol
-IR_Fair_180_UnPol,Unpolarized_A_IR,C4,PI,-214.43078519691852,55.793587163554704,Day_4,Experiment_3,IR,Fair,180,Un. Pol
-IR_Fair_180_UnPol,Unpolarized_B_Green,C11,PI,-207.59773164509366,29.830737270157623,Day_4,Experiment_3,IR,Fair,180,Un. Pol
-IR_Fair_180_UnPol,Unpolarized_B_Red,C8,PI,-207.27336526583622,29.675871581206792,Day_4,Experiment_3,IR,Fair,180,Un. Pol
-IR_Fair_180_UnPol,Unpolarized_B_IR,C10,PI,-198.43475948301563,37.10958262075885,Day_4,Experiment_3,IR,Fair,180,Un. Pol
-IR_Fair_180_UnPol,Co-Polarized_Green,C13,PI,-214.84024297964595,56.67585721371904,Day_4,Experiment_3,IR,Fair,180,Un. Pol
-IR_Fair_180_UnPol,Co-Polarized_Red,C12,PI,-212.88529381644219,47.750230885840146,Day_4,Experiment_3,IR,Fair,180,Un. Pol
-IR_Fair_180_UnPol,Co-Polarized_IR,C15,PI,-209.83258601292093,130.46394251468055,Day_4,Experiment_3,IR,Fair,180,Un. Pol
-IR_Fair_180_UnPol,Cross-Polarized_Green,C19,PI,-208.23435891274224,43.097276982050246,Day_4,Experiment_3,IR,Fair,180,Un. Pol
-IR_Fair_180_UnPol,Cross-Polarized_Red,C18,PI,-191.55785732295806,27.585764206978684,Day_4,Experiment_3,IR,Fair,180,Un. Pol
-IR_Fair_180_UnPol,Cross-Polarized_IR,C21,PI,-209.86715110487074,43.32410527279409,Day_4,Experiment_3,IR,Fair,180,Un. Pol
+version https://git-lfs.github.com/spec/v1
+oid sha256:45acd3e54c6cc65036e46875e76eec61b93cb488e3a2866701106eeaf3072656
+size 1554
