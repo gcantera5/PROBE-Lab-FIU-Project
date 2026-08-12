@@ -340,8 +340,32 @@ def clipping_sqi(raw_beat):
     clipped_fraction = np.mean(near_max | near_min)
     return float(1.0 - clipped_fraction)
 
+def compute_perfusion_index(original_beat):
+    """
+    Compute beat-by-beat perfusion index (PI).
 
-def compute_beat_features(raw_beat, norm_beat, template, start_idx, end_idx, beat_number, config):
+    DC = local trough / minimum of the beat
+    AC = systolic peak - DC
+    PI = (AC / DC) * 100
+    """
+    original_beat = np.asarray(original_beat, dtype=float)
+
+    if len(original_beat) == 0:
+        return np.nan, np.nan, np.nan
+
+    dc_value = float(np.min(original_beat))
+    peak_value = float(np.max(original_beat))
+    ac_value = peak_value - dc_value
+
+    if dc_value == 0:
+        pi = np.nan
+    else:
+        pi = (ac_value / abs(dc_value)) * 100.0
+
+    return ac_value, dc_value, pi
+
+
+def compute_beat_features(raw_beat,original_beat, norm_beat, template, start_idx, end_idx,beat_number,config):
     """
     Compute beat-level SQI features:
     DTW, correlation, AD, MAD, skewness, clipping SQI, duration, HR.
@@ -356,26 +380,32 @@ def compute_beat_features(raw_beat, norm_beat, template, start_idx, end_idx, bea
     ad = float(np.sum(np.abs(difference)))
     beat_skewness = float(skew(norm_beat, nan_policy="omit"))
     clip_sqi = clipping_sqi(raw_beat)
+    ac_value, dc_value, perfusion_index = compute_perfusion_index(original_beat)
 
     duration_sec = (end_idx - start_idx) / config.fs
     estimated_hr = 60.0 / duration_sec if duration_sec > 0 else np.nan
 
     return {
-        "beat_number": beat_number,
-        "beat_start_idx": start_idx,
-        "beat_end_idx": end_idx,
-        "beat_start_sec": start_idx / config.fs,
-        "beat_end_sec": end_idx / config.fs,
-        "duration_sec": duration_sec,
-        "estimated_hr": estimated_hr,
-        "dtw_distance": dtw_distance,
-        "template_sqi": template_sqi,
-        "correlation": corr,
-        "AD": ad,
-        "MAD": mad,
-        "skewness": beat_skewness,
-        "clipping_sqi": clip_sqi,
-    }
+    "beat_number": beat_number,
+    "beat_start_idx": start_idx,
+    "beat_end_idx": end_idx,
+    "beat_start_sec": start_idx / config.fs,
+    "beat_end_sec": end_idx / config.fs,
+    "duration_sec": duration_sec,
+    "estimated_hr": estimated_hr,
+
+    "AC": ac_value,
+    "DC": dc_value,
+    "perfusion_index": perfusion_index,
+
+    "dtw_distance": dtw_distance,
+    "template_sqi": template_sqi,
+    "correlation": corr,
+    "AD": ad,
+    "MAD": mad,
+    "skewness": beat_skewness,
+    "clipping_sqi": clip_sqi,
+}
 
 
 # def classify_beat(row, config):
@@ -431,6 +461,11 @@ def run_beat_level_sqi(ppg, config=None):
 
     raw_beats, beat_indices = segment_beats_by_valleys(filtered, config)
 
+    original_beats = [
+        np.asarray(ppg[start_idx:end_idx], dtype=float) 
+        for start_idx, end_idx in beat_indices
+    ]
+
     if len(raw_beats) < 3:
         return None
 
@@ -440,11 +475,11 @@ def run_beat_level_sqi(ppg, config=None):
 
     rows = []
 
-    for beat_number, (raw_beat, norm_beat, (start_idx, end_idx)) in enumerate(
-        zip(raw_beats, norm_beats, beat_indices)
-    ):
+    for beat_number, (raw_beat, original_beat, norm_beat,(start_idx, end_idx)) in enumerate(
+    zip(raw_beats, original_beats, norm_beats, beat_indices)):
         row = compute_beat_features(
             raw_beat=raw_beat,
+            original_beat=original_beat,
             norm_beat=norm_beat,
             template=template,
             start_idx=start_idx,
@@ -481,6 +516,7 @@ def run_beat_level_sqi(ppg, config=None):
         "mean_correlation": float(feature_table["correlation"].mean()),
         "mean_MAD": float(feature_table["MAD"].mean()),
         "window_label": window_label,
+        "mean_perfusion_index": float(feature_table["perfusion_index"].mean()),
     }
 
     return {
@@ -714,6 +750,7 @@ def process_experiment1_complete(
                         print(f"Mean DTW: {window_df['mean_dtw_distance'].mean():.4f}")
                         print(f"Mean Correlation: {window_df['mean_correlation'].mean():.4f}")
                         print(f"Mean MAD: {window_df['mean_MAD'].mean():.4f}")
+                        print(f"Mean PI: {window_df['mean_perfusion_index'].mean():.4f}%")
 
                         good_windows = (window_df["window_label"] == "good_window").sum()
                         total_windows = len(window_df)
@@ -761,6 +798,8 @@ def process_experiment1_complete(
                             ),
                             "MeanTemplateSQI": float(
                                 window_df["mean_template_sqi"].mean()
+                            ),
+                            "MeanPI": float(window_df["mean_perfusion_index"].mean()
                             ),
                         }
 
@@ -1024,6 +1063,8 @@ def process_day3_experiment2(
                     "MeanTemplateSQI": float(
                         window_df["mean_template_sqi"].mean()
                     ),
+                    "MeanPI": float( window_df["mean_perfusion_index"].mean()
+                    ),
                 }
 
                 all_summary_results.append(summary_row)
@@ -1224,6 +1265,7 @@ def process_day4_experiments(
                             print(f"Mean DTW: {window_df['mean_dtw_distance'].mean():.4f}")
                             print(f"Mean Correlation: {window_df['mean_correlation'].mean():.4f}")
                             print(f"Mean MAD: {window_df['mean_MAD'].mean():.4f}")
+                            print(f"Mean PI: " f"{window_df['mean_perfusion_index'].mean():.4f}%")
 
                             good_windows = (
                                 window_df["window_label"] == "good_window"
@@ -1274,6 +1316,9 @@ def process_day4_experiments(
                                 ),
                                 "MeanTemplateSQI": float(
                                     window_df["mean_template_sqi"].mean()
+                                ),
+
+                                "MeanPI": float(window_df["mean_perfusion_index"].mean()
                                 ),
                             }
 
@@ -1513,15 +1558,19 @@ def debug_one_file_one_channel(
     print(f"Channel: {channel_label}")
     print(result["summary"])
     print(feature_table[[
-        "beat_number",
-        "dtw_distance",
-        "correlation",
-        "MAD",
-        "template_sqi",
-        "clipping_sqi",
-        "beat_label",
-        "rejection_reasons"
+    "beat_number",
+    "AC",
+    "DC",
+    "perfusion_index",
+    "dtw_distance",
+    "correlation",
+    "MAD",
+    "template_sqi",
+    "clipping_sqi",
+    "beat_label",
+    "rejection_reasons"
     ]])
+
 
     # Plot 1: filtered PPG with detected valleys
     t = np.arange(len(filtered)) / config.fs
