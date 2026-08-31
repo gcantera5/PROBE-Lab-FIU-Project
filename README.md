@@ -30,6 +30,17 @@ Instead of assuming that an entire recording has the same signal quality, the pi
 
 ---
 
+# Recent Pipeline Updates
+
+**August 2026:** Following a review of the processing order, a few changes were made to `beat_level_sqi.py`:
+
+- The bandpass filter's upper cutoff was widened from 2.2 Hz (132 BPM) to 4 Hz (240 BPM).
+- Beat quality metrics (DTW distance, correlation, MAD, template SQI) are now calculated **before** beats are rescaled in height, using beats that have only been lined up in time. Previously, beats were rescaled in height first, which could hide real quality differences tied to a beat's amplitude.
+- The height-rescaling step itself changed from a mean/standard-deviation rescaling to a minimum/maximum rescaling (0 to 1), and now runs *after* quality has been determined rather than before, since it's used for downstream purposes rather than the quality decision itself.
+- Because quality metrics are now computed in real amplitude units instead of rescaled ones, the current SQI thresholds are expected to need re-tuning (see Limitations).
+
+---
+
 # Study Design
 
 The phantom study was designed around several optical and physiological parameters:
@@ -269,15 +280,17 @@ The bandpass filter keeps the frequency range where we expect the heartbeat sign
 The expected heart rate range is approximately:
 
 - 0.5 Hz = 30 BPM
-- 2.2 Hz = 132 BPM
+- 4.0 Hz = 240 BPM
 
-This range includes the phantom speeds used in the experiments:
+This range comfortably covers the phantom speeds used in the experiments:
 
 - 60 BPM
 - 90 BPM
 - 120 BPM
 
-Removing frequencies outside this range helps make the pulse waveform easier to detect.
+The upper cutoff was widened from 2.2 Hz (132 BPM) to 4 Hz (240 BPM) so the filter keeps more of the natural shape of each pulse instead of smoothing it away. The narrower cutoff was closer to only the fundamental heart-rate frequency, which could flatten out real shape differences between a clean beat and a distorted one before the beat-level SQI metrics get a chance to see them.
+
+Removing frequencies outside this range still helps make the pulse waveform easier to detect.
 
 ---
 
@@ -326,17 +339,25 @@ This gives us individual waveforms that can be compared instead of only looking 
 
 ---
 
+## Lining Up Beats, Without Changing Their Height
+
+Beats don't all last the same amount of time -- a fast heartbeat produces a shorter beat than a slow one. Before beats can be compared to each other or to a template, they need to be stretched or compressed onto the same timeline, the same way you might stretch a rubber band to line up two drawings that are different lengths.
+
+This step only changes how long a beat looks -- it does **not** change how tall or short the beat is. A weak, low-amplitude beat stays weak after this step, and a strong beat stays strong. That's on purpose: the height of a beat is often exactly what tells us whether it's a good beat or a noisy one, so we don't want to erase that information before we've had a chance to look at it.
+
+---
+
 ## Representative Beat Template
 
-Once the individual beats in a window are detected, the beats are normalized and used to create a representative beat template.
+Once the individual beats in a window have been lined up on the same timeline (as described above), they're used to build a representative beat template -- but their real height is still intact at this point.
 
-The template gives us an estimate of what a typical beat looks like within that section of the recording.
+The template is built by averaging the beats that already look most alike, so a few odd or noisy beats can't drag it off course. The result is an estimate of what a typical beat looks like within that section of the recording, at roughly the recording's real amplitude rather than an artificially rescaled one.
 
 Each detected beat can then be compared against this template.
 
-A beat that looks very similar to the template is more likely to represent a consistent PPG pulse.
+A beat that looks very similar to the template -- in both shape *and* height -- is more likely to represent a consistent PPG pulse.
 
-A beat that looks very different may contain noise, distortion, or an unstable waveform.
+A beat that looks very different, including one that's unusually weak or unusually strong, may contain noise, distortion, or an unstable waveform.
 
 ---
 
@@ -357,7 +378,7 @@ The main metrics currently include:
 
 ## Dynamic Time Warping (DTW)
 
-Dynamic Time Warping measures how different the shape of an individual beat is from the representative beat template.
+Dynamic Time Warping measures how different an individual beat is from the representative beat template -- in both shape and height, since neither has been artificially rescaled at this point.
 
 It allows for small differences in timing while still comparing the overall morphology of the waveforms.
 
@@ -366,13 +387,13 @@ In general:
 - smaller DTW distance = beat is more similar to the template
 - larger DTW distance = beat differs more from the template
 
-This makes DTW useful for identifying beats with unusual or distorted shapes.
+This makes DTW useful for identifying beats with unusual or distorted shapes, including beats that are simply too weak or too strong compared to the rest of the recording.
 
 ---
 
 ## Correlation
 
-Correlation measures how closely the shape of an individual beat follows the representative template.
+Correlation measures how closely the shape of an individual beat follows the representative template. Correlation isn't affected by how tall or short a beat is -- it only cares about shape -- so it gives the same answer whether or not a beat's height has been rescaled.
 
 In general:
 
@@ -385,14 +406,14 @@ A high correlation suggests that the beat follows the general waveform shape exp
 
 ## Mean Absolute Deviation (MAD)
 
-MAD measures the average difference between an individual beat and the representative template.
+MAD measures the average difference between an individual beat and the representative template, sample by sample. Unlike correlation, MAD is affected by height -- an unusually weak or unusually strong beat will show up as a larger MAD, which is why it's calculated before any height rescaling happens.
 
 In general:
 
 - lower MAD = beat is closer to the template
 - higher MAD = beat differs more from the template
 
-While correlation focuses more on whether two waveforms follow a similar shape, MAD gives us information about how far apart they are.
+While correlation focuses more on whether two waveforms follow a similar shape, MAD gives us information about how far apart they are, including differences in height.
 
 ---
 
@@ -409,6 +430,16 @@ Using individual thresholds gives us a more interpretable starting point because
 The current thresholds should still be considered preliminary. As more of the FIU data are analyzed, we can look at the distributions of these metrics and determine whether the thresholds should be adjusted.
 
 A future version of the pipeline could use these SQIs as features for a machine-learning model that learns how to classify good and bad beats.
+
+---
+
+# Rescaling Beats for Downstream Use
+
+Once a beat has already been measured and labeled good or bad, the pipeline creates one more version of it: a rescaled copy where the lowest point of the beat is shifted down to 0 and the highest point is shifted up to 1, with everything else falling somewhere in between.
+
+This is different from the height-preserving version used earlier for the template and the quality metrics above. This rescaled, 0-to-1 version isn't used to decide whether a beat is good or bad -- it exists for whatever comes after that decision, such as plotting beats on a common scale or feeding them into a future classifier that expects a consistent 0-to-1 range.
+
+This is also a change from an earlier version of the pipeline, which used to rescale each beat by subtracting its average value and dividing by its own spread (a "mean/standard-deviation" rescaling, which typically produced values roughly between -1 and 1). The pipeline now uses a minimum/maximum rescaling instead, and -- more importantly -- does it *after* the quality metrics are calculated rather than before, so a beat's real height is what the SQI metrics actually see.
 
 ---
 
@@ -649,6 +680,8 @@ The current SQI thresholds are also preliminary.
 They provide a starting point for separating more consistent beats from lower-quality beats, but they have not yet been treated as final validated thresholds.
 
 As more of the dataset is analyzed, these values can be revisited using the actual distributions of the SQI metrics.
+
+This is especially true after the recent change to compute quality metrics before rescaling beats (see "Rescaling Beats for Downstream Use" above): DTW distance and MAD are now calculated in the recording's real amplitude units rather than a rescaled one, so their typical values have shifted, and the current thresholds should be re-checked against the new numbers rather than assumed to still apply.
 
 ---
 

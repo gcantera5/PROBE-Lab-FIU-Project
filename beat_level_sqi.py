@@ -48,7 +48,7 @@ class BeatSQIConfig:
 
     # FIU-style filtering
     lowcut: float = 0.5
-    highcut: float = 2.2
+    highcut: float = 4.0
     filter_order: int = 4
     rs: int = 20
 
@@ -247,50 +247,79 @@ def safe_corr(x, y):
     return float(np.corrcoef(x, y)[0, 1])
 
 
-def normalize_single_beat(beat, target_length):
+def resample_single_beat(beat, target_length):
     """
-    Normalize amplitude and resample beat to uniform length.
+    Time-align a beat to a uniform length WITHOUT changing its amplitude.
+    Used for quality/template comparisons so amplitude-based quality
+    signal (weak perfusion, clipping, motion distortion) isn't erased
+    before we measure it.
     """
     beat = np.asarray(beat, dtype=float)
-    beat = beat - np.mean(beat)
-
-    std = np.std(beat)
-    if std > 0:
-        beat = beat / std
-
     return resample(beat, target_length)
 
 
+def resample_beats(raw_beats, config):
+    """Time-align (resample) all beats to the same length, amplitude untouched."""
+    return np.array([
+        resample_single_beat(beat, config.target_beat_length)
+        for beat in raw_beats
+    ])
+
+
+def normalize_single_beat(beat, target_length):
+    """
+    Resample a beat to uniform length, then min-max scale it to [0, 1]
+    (shift by the beat's minimum, divide by its range).
+    Applied AFTER quality/classification -- this is for downstream use
+    (plots, ML features, cross-beat comparison), not for computing SQI.
+    """
+    beat = np.asarray(beat, dtype=float)
+    resampled = resample(beat, target_length)
+
+    beat_min = np.min(resampled)
+    beat_range = np.max(resampled) - beat_min
+
+    if beat_range > 0:
+        resampled = (resampled - beat_min) / beat_range
+    else:
+        resampled = resampled - beat_min
+
+    return resampled
+
+
 def normalize_beats(raw_beats, config):
-    """Normalize all beats to the same length."""
+    """Min-max normalize (0-1) all beats to the same length, for downstream use."""
     return np.array([
         normalize_single_beat(beat, config.target_beat_length)
         for beat in raw_beats
     ])
 
 
-def make_clean_template(norm_beats, config):
+def make_clean_template(resampled_beats, config):
     """
     Build a clean template beat by averaging around 12 template-like beats.
+    Uses time-aligned (resampled) beats WITHOUT amplitude normalization, so
+    quality comparisons against this template stay sensitive to real
+    amplitude differences between beats.
     """
-    if len(norm_beats) == 0:
+    if len(resampled_beats) == 0:
         raise ValueError("No beats available to build template.")
 
-    n_initial = min(config.n_template_beats, len(norm_beats))
-    rough_template = np.mean(norm_beats[:n_initial], axis=0)
+    n_initial = min(config.n_template_beats, len(resampled_beats))
+    rough_template = np.mean(resampled_beats[:n_initial], axis=0)
 
     correlations = np.array([
         safe_corr(beat, rough_template)
-        for beat in norm_beats
+        for beat in resampled_beats
     ])
 
     good_idx = np.where(correlations >= config.template_corr_threshold)[0]
 
-    if len(good_idx) < min(3, len(norm_beats)):
+    if len(good_idx) < min(3, len(resampled_beats)):
         good_idx = np.argsort(correlations)[::-1]
 
     selected_idx = good_idx[:min(config.n_template_beats, len(good_idx))]
-    template = np.mean(norm_beats[selected_idx], axis=0)
+    template = np.mean(resampled_beats[selected_idx], axis=0)
 
     return template, selected_idx
 
@@ -365,20 +394,25 @@ def compute_perfusion_index(original_beat):
     return ac_value, dc_value, pi
 
 
-def compute_beat_features(raw_beat,original_beat, norm_beat, template, start_idx, end_idx,beat_number,config):
+def compute_beat_features(raw_beat, original_beat, resampled_beat, template, start_idx, end_idx, beat_number, config):
     """
     Compute beat-level SQI features:
     DTW, correlation, AD, MAD, skewness, clipping SQI, duration, HR.
-    """
-    difference = norm_beat - template
 
-    dtw_distance = compute_dtw_distance(norm_beat, template)
+    Quality metrics (DTW distance, correlation, MAD, AD, skewness) are
+    computed on the time-aligned-but-not-amplitude-normalized beat
+    (resampled_beat) against a template built the same way, so per-beat
+    amplitude normalization can't mask real quality differences.
+    """
+    difference = resampled_beat - template
+
+    dtw_distance = compute_dtw_distance(resampled_beat, template)
     template_sqi = compute_template_sqi(dtw_distance, config)
 
-    corr = max(0.0, safe_corr(norm_beat, template))
+    corr = max(0.0, safe_corr(resampled_beat, template))
     mad = float(np.mean(np.abs(difference)))
     ad = float(np.sum(np.abs(difference)))
-    beat_skewness = float(skew(norm_beat, nan_policy="omit"))
+    beat_skewness = float(skew(resampled_beat, nan_policy="omit"))
     clip_sqi = clipping_sqi(raw_beat)
     ac_value, dc_value, perfusion_index = compute_perfusion_index(original_beat)
 
@@ -469,18 +503,23 @@ def run_beat_level_sqi(ppg, config=None):
     if len(raw_beats) < 3:
         return None
 
-    norm_beats = normalize_beats(raw_beats, config)
+    # Time-align beats (no amplitude change) for quality/template comparison.
+    resampled_beats = resample_beats(raw_beats, config)
 
-    template, template_indices = make_clean_template(norm_beats, config)
+    # Min-max (0-1) normalized beats, for downstream use only -- NOT used
+    # for quality computation or classification.
+    normalized_beats = normalize_beats(raw_beats, config)
+
+    template, template_indices = make_clean_template(resampled_beats, config)
 
     rows = []
 
-    for beat_number, (raw_beat, original_beat, norm_beat,(start_idx, end_idx)) in enumerate(
-    zip(raw_beats, original_beats, norm_beats, beat_indices)):
+    for beat_number, (raw_beat, original_beat, resampled_beat, (start_idx, end_idx)) in enumerate(
+    zip(raw_beats, original_beats, resampled_beats, beat_indices)):
         row = compute_beat_features(
             raw_beat=raw_beat,
             original_beat=original_beat,
-            norm_beat=norm_beat,
+            resampled_beat=resampled_beat,
             template=template,
             start_idx=start_idx,
             end_idx=end_idx,
@@ -522,7 +561,8 @@ def run_beat_level_sqi(ppg, config=None):
     return {
         "filtered_signal": filtered,
         "raw_beats": raw_beats,
-        "normalized_beats": norm_beats,
+        "resampled_beats": resampled_beats,
+        "normalized_beats": normalized_beats,
         "template": template,
         "feature_table": feature_table,
         "summary": summary,
@@ -1551,7 +1591,7 @@ def debug_one_file_one_channel(
 
     filtered = result["filtered_signal"]
     feature_table = result["feature_table"]
-    norm_beats = result["normalized_beats"]
+    resampled_beats = result["resampled_beats"]
     template = result["template"]
 
     print("\n===== DEBUG SUMMARY =====")
@@ -1593,15 +1633,15 @@ def debug_one_file_one_channel(
     plt.tight_layout()
     plt.show()
 
-    # Plot 2: normalized beats + template
+    # Plot 2: time-aligned beats (raw amplitude) + template
     plt.figure(figsize=(8, 4))
-    for beat in norm_beats:
+    for beat in resampled_beats:
         plt.plot(beat, alpha=0.25, linewidth=1)
 
     plt.plot(template, linewidth=3, label="Template beat")
-    plt.title(f"{channel_label}: Normalized Beats + Template")
-    plt.xlabel("Normalized sample")
-    plt.ylabel("Normalized amplitude")
+    plt.title(f"{channel_label}: Time-Aligned Beats + Template (raw amplitude)")
+    plt.xlabel("Resampled sample")
+    plt.ylabel("Filtered amplitude")
     plt.legend()
     plt.grid(True, linestyle="--", alpha=0.4)
     plt.tight_layout()
