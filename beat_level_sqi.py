@@ -61,12 +61,10 @@ class BeatSQIConfig:
     target_beat_length: int = 50
     n_template_beats: int = 12
     template_corr_threshold: float = 0.80
-
-    # SQI thresholds
-    sqi_lambda: float = 25.0
+    sqi_lambda: float = 0.30
     min_template_sqi: float = 0.05
     min_corr: float = 0.80
-    max_mad: float = 0.60
+    max_mad: float = 30.0
     min_clipping_sqi: float = 0.80
 
     # Window rejection
