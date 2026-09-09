@@ -4,12 +4,12 @@ import json
 import gzip
 import shutil
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import Optional
 import matplotlib.pyplot as plt
 
 import numpy as np
 import pandas as pd
-from scipy.signal import cheby2, sosfiltfilt, find_peaks, medfilt, resample
+from scipy.signal import cheby2, sosfiltfilt, find_peaks, resample
 from scipy.stats import skew
 
 try:
@@ -40,36 +40,54 @@ WAVELENGTH_NM = {
 
 @dataclass
 class BeatSQIConfig:
+    """
+    Config for the approved pipeline (per 10-second window):
+      filter -> PI (from the RAW window, not the filtered one)
+             -> segment into beats (on the filtered signal)
+             -> normalize each beat (0-1)
+             -> compare each beat to a template
+             -> classify each beat -> roll up to a window label
+                (bad if > bad_window_fraction_threshold of beats are bad)
+    """
     fs: int = FS
 
-    # GT recommended removing low-frequency components
-    remove_baseline: bool = True
-    baseline_kernel_seconds: float = 0.75
-
-    # FIU-style filtering
+    # Chebyshev Type II bandpass filter (used for beat segmentation/comparison)
     lowcut: float = 0.5
     highcut: float = 4.0
     filter_order: int = 4
     rs: int = 20
+
+    # Window definition (10-second windows, 1-second stride)
+    window_seconds: int = 10
+    step_seconds: int = 1
 
     # Beat segmentation
     min_hr: float = 40
     max_hr: float = 180
     valley_prominence: Optional[float] = None
 
-    # Beat normalization/template
+    # Beat normalization + template
     target_beat_length: int = 50
     n_template_beats: int = 12
     template_corr_threshold: float = 0.80
+
+    # Beat classification thresholds -- back to the original values.
+    # (Sept 2026: briefly retuned sqi_lambda/min_template_sqi/max_mad using
+    # real per-beat data -- see project notes -- since the values below are
+    # calibrated for the pre-normalization amplitude scale and essentially
+    # never fire on beats that have been through per-beat 0-1 normalization.
+    # Reverted because the retuning barely moved the overall good/bad split
+    # -- correlation and clipping were already catching nearly the same
+    # beats -- so decided it wasn't worth carrying non-standard values for.)
     sqi_lambda: float = 0.30
     min_template_sqi: float = 0.05
     min_corr: float = 0.80
     max_mad: float = 30.0
     min_clipping_sqi: float = 0.80
 
-    # Window rejection
-    window_seconds: int = 10
-    step_seconds: int = 1
+    # Window rejection: bad if more than this fraction of a window's beats
+    # are bad (starting value carried over from the original pipeline --
+    # treat as tunable once this runs on real data)
     bad_window_fraction_threshold: float = 0.30
 
 
@@ -137,28 +155,6 @@ def load_fiu_json(json_path, condition_info):
 # SIGNAL PREPROCESSING
 # ============================================================
 
-def remove_low_frequency_baseline(ppg, config):
-    """
-    Removes slow baseline drift before beat detection.
-    Removes low-frequency components.
-    """
-    ppg = np.asarray(ppg, dtype=float)
-
-    if not config.remove_baseline:
-        return ppg
-
-    kernel = int(round(config.baseline_kernel_seconds * config.fs))
-
-    if kernel < 3:
-        return ppg
-
-    if kernel % 2 == 0:
-        kernel += 1
-
-    baseline = medfilt(ppg, kernel_size=kernel)
-    return ppg - baseline
-
-
 def bandpass_filter(ppg, config):
     """
     Chebyshev Type II bandpass filter
@@ -182,15 +178,48 @@ def bandpass_filter(ppg, config):
 
 def preprocess_ppg(ppg, config):
     """
-    Full preprocessing:
-    1. remove low-frequency baseline drift
-    2. bandpass filter
-    3. zero-center
+    Preprocessing for one window: Chebyshev Type II bandpass filter only.
+    Used to get a clean signal for beat segmentation and beat comparison.
+
+    No separate median-filter baseline removal or zero-centering step
+    (dropped per earlier discussion).
     """
-    no_baseline = remove_low_frequency_baseline(ppg, config)
-    filtered = bandpass_filter(no_baseline, config)
-    centered = filtered - np.nanmean(filtered)
-    return np.nan_to_num(centered, nan=0.0)
+    ppg = np.asarray(ppg, dtype=float)
+    filtered = bandpass_filter(ppg, config)
+    return np.nan_to_num(filtered, nan=0.0)
+
+
+# ============================================================
+# PERFUSION INDEX
+# ============================================================
+
+def compute_perfusion_index(signal):
+    """
+    Compute the perfusion index (PI) of one signal. Called once per
+    10-second window, on the RAW (unfiltered) window signal -- per Mark's
+    feedback, computing PI from the bandpass-FILTERED signal blows up
+    (the filter removes the DC/baseline component, so dividing by a
+    near-zero "DC" sends PI into the hundreds/thousands of percent).
+
+    DC = trough / minimum of the signal
+    AC = peak - DC
+    PI = (AC / DC) * 100
+    """
+    signal = np.asarray(signal, dtype=float)
+
+    if len(signal) == 0:
+        return np.nan, np.nan, np.nan
+
+    dc_value = float(np.min(signal))
+    peak_value = float(np.max(signal))
+    ac_value = peak_value - dc_value
+
+    if dc_value == 0:
+        pi = np.nan
+    else:
+        pi = (ac_value / abs(dc_value)) * 100.0
+
+    return ac_value, dc_value, pi
 
 
 # ============================================================
@@ -199,8 +228,8 @@ def preprocess_ppg(ppg, config):
 
 def segment_beats_by_valleys(ppg, config):
     """
-    Extract non-overlapping beats using valley-to-valley intervals.
-    Beat-level workflow.
+    Extract non-overlapping beats using valley-to-valley intervals, on the
+    filtered window signal.
     """
     min_distance = int(config.fs * 60.0 / config.max_hr)
 
@@ -245,31 +274,11 @@ def safe_corr(x, y):
     return float(np.corrcoef(x, y)[0, 1])
 
 
-def resample_single_beat(beat, target_length):
-    """
-    Time-align a beat to a uniform length WITHOUT changing its amplitude.
-    Used for quality/template comparisons so amplitude-based quality
-    signal (weak perfusion, clipping, motion distortion) isn't erased
-    before we measure it.
-    """
-    beat = np.asarray(beat, dtype=float)
-    return resample(beat, target_length)
-
-
-def resample_beats(raw_beats, config):
-    """Time-align (resample) all beats to the same length, amplitude untouched."""
-    return np.array([
-        resample_single_beat(beat, config.target_beat_length)
-        for beat in raw_beats
-    ])
-
-
 def normalize_single_beat(beat, target_length):
     """
-    Resample a beat to uniform length, then min-max scale it to [0, 1]
-    (shift by the beat's minimum, divide by its range).
-    Applied AFTER quality/classification -- this is for downstream use
-    (plots, ML features, cross-beat comparison), not for computing SQI.
+    Resample a beat to a uniform length, then min-max scale it to [0, 1].
+    This is the "normalize the beat" step in the approved pipeline --
+    beats are compared to the template AFTER this normalization.
     """
     beat = np.asarray(beat, dtype=float)
     resampled = resample(beat, target_length)
@@ -286,38 +295,37 @@ def normalize_single_beat(beat, target_length):
 
 
 def normalize_beats(raw_beats, config):
-    """Min-max normalize (0-1) all beats to the same length, for downstream use."""
+    """Normalize (resample + 0-1 scale) all beats in a window."""
     return np.array([
         normalize_single_beat(beat, config.target_beat_length)
         for beat in raw_beats
     ])
 
 
-def make_clean_template(resampled_beats, config):
+def make_clean_template(normalized_beats, config):
     """
-    Build a clean template beat by averaging around 12 template-like beats.
-    Uses time-aligned (resampled) beats WITHOUT amplitude normalization, so
-    quality comparisons against this template stay sensitive to real
-    amplitude differences between beats.
+    Build a clean template beat by averaging around 12 template-like
+    beats, using the NORMALIZED beats (per the approved pipeline order:
+    normalize each beat, then compare to the template).
     """
-    if len(resampled_beats) == 0:
+    if len(normalized_beats) == 0:
         raise ValueError("No beats available to build template.")
 
-    n_initial = min(config.n_template_beats, len(resampled_beats))
-    rough_template = np.mean(resampled_beats[:n_initial], axis=0)
+    n_initial = min(config.n_template_beats, len(normalized_beats))
+    rough_template = np.mean(normalized_beats[:n_initial], axis=0)
 
     correlations = np.array([
         safe_corr(beat, rough_template)
-        for beat in resampled_beats
+        for beat in normalized_beats
     ])
 
     good_idx = np.where(correlations >= config.template_corr_threshold)[0]
 
-    if len(good_idx) < min(3, len(resampled_beats)):
+    if len(good_idx) < min(3, len(normalized_beats)):
         good_idx = np.argsort(correlations)[::-1]
 
     selected_idx = good_idx[:min(config.n_template_beats, len(good_idx))]
-    template = np.mean(resampled_beats[selected_idx], axis=0)
+    template = np.mean(normalized_beats[selected_idx], axis=0)
 
     return template, selected_idx
 
@@ -327,9 +335,7 @@ def make_clean_template(resampled_beats, config):
 # ============================================================
 
 def compute_dtw_distance(beat, template):
-    """
-    Compare beat to template with DTW.
-    """
+    """Compare beat to template with DTW."""
     if dtw is None:
         raise ImportError("Please install dtw-python using: pip install dtw-python")
 
@@ -339,124 +345,78 @@ def compute_dtw_distance(beat, template):
 
 def compute_template_sqi(dtw_distance, config):
     """
-    Convert DTW distance into SQI.
-    Small distance = high SQI.
-    Large distance = low SQI.
+    Convert DTW distance into SQI. Small distance = high SQI, large
+    distance = low SQI.
     """
     return float(np.exp(-config.sqi_lambda * dtw_distance))
 
 
-def clipping_sqi(raw_beat):
+def clipping_sqi(signal):
     """
-    Estimate how much of a beat is clipped/saturated.
-    1.0 = not clipped.
-    Lower values = more clipping.
+    Estimate how much of a signal is clipped/saturated.
+    1.0 = not clipped. Lower values = more clipping.
+    Scale-invariant (a ratio relative to the signal's own min/max), so it
+    gives the same result whether computed on the raw or normalized beat.
     """
-    raw_beat = np.asarray(raw_beat, dtype=float)
+    signal = np.asarray(signal, dtype=float)
 
-    beat_range = np.max(raw_beat) - np.min(raw_beat)
+    sig_range = np.max(signal) - np.min(signal)
 
-    if beat_range == 0:
+    if sig_range == 0:
         return 0.0
 
-    eps = 0.01 * beat_range
+    eps = 0.01 * sig_range
 
-    near_max = raw_beat >= (np.max(raw_beat) - eps)
-    near_min = raw_beat <= (np.min(raw_beat) + eps)
+    near_max = signal >= (np.max(signal) - eps)
+    near_min = signal <= (np.min(signal) + eps)
 
     clipped_fraction = np.mean(near_max | near_min)
     return float(1.0 - clipped_fraction)
 
-def compute_perfusion_index(original_beat):
+
+def compute_beat_features(raw_beat, normalized_beat, template, start_idx, end_idx, beat_number, config):
     """
-    Compute beat-by-beat perfusion index (PI).
-
-    DC = local trough / minimum of the beat
-    AC = systolic peak - DC
-    PI = (AC / DC) * 100
+    Compute beat-level SQI features -- DTW distance, correlation, AD, MAD,
+    skewness, clipping -- by comparing the NORMALIZED beat to the template
+    (also built from normalized beats), matching the approved pipeline
+    order (normalize the beat, then compare to template).
     """
-    original_beat = np.asarray(original_beat, dtype=float)
+    difference = normalized_beat - template
 
-    if len(original_beat) == 0:
-        return np.nan, np.nan, np.nan
-
-    dc_value = float(np.min(original_beat))
-    peak_value = float(np.max(original_beat))
-    ac_value = peak_value - dc_value
-
-    if dc_value == 0:
-        pi = np.nan
-    else:
-        pi = (ac_value / abs(dc_value)) * 100.0
-
-    return ac_value, dc_value, pi
-
-
-def compute_beat_features(raw_beat, original_beat, resampled_beat, template, start_idx, end_idx, beat_number, config):
-    """
-    Compute beat-level SQI features:
-    DTW, correlation, AD, MAD, skewness, clipping SQI, duration, HR.
-
-    Quality metrics (DTW distance, correlation, MAD, AD, skewness) are
-    computed on the time-aligned-but-not-amplitude-normalized beat
-    (resampled_beat) against a template built the same way, so per-beat
-    amplitude normalization can't mask real quality differences.
-    """
-    difference = resampled_beat - template
-
-    dtw_distance = compute_dtw_distance(resampled_beat, template)
+    dtw_distance = compute_dtw_distance(normalized_beat, template)
     template_sqi = compute_template_sqi(dtw_distance, config)
 
-    corr = max(0.0, safe_corr(resampled_beat, template))
+    corr = max(0.0, safe_corr(normalized_beat, template))
     mad = float(np.mean(np.abs(difference)))
     ad = float(np.sum(np.abs(difference)))
-    beat_skewness = float(skew(resampled_beat, nan_policy="omit"))
+    beat_skewness = float(skew(normalized_beat, nan_policy="omit"))
     clip_sqi = clipping_sqi(raw_beat)
-    ac_value, dc_value, perfusion_index = compute_perfusion_index(original_beat)
 
     duration_sec = (end_idx - start_idx) / config.fs
     estimated_hr = 60.0 / duration_sec if duration_sec > 0 else np.nan
 
     return {
-    "beat_number": beat_number,
-    "beat_start_idx": start_idx,
-    "beat_end_idx": end_idx,
-    "beat_start_sec": start_idx / config.fs,
-    "beat_end_sec": end_idx / config.fs,
-    "duration_sec": duration_sec,
-    "estimated_hr": estimated_hr,
+        "beat_number": beat_number,
+        "beat_start_idx": start_idx,
+        "beat_end_idx": end_idx,
+        "beat_start_sec": start_idx / config.fs,
+        "beat_end_sec": end_idx / config.fs,
+        "duration_sec": duration_sec,
+        "estimated_hr": estimated_hr,
 
-    "AC": ac_value,
-    "DC": dc_value,
-    "perfusion_index": perfusion_index,
+        "dtw_distance": dtw_distance,
+        "template_sqi": template_sqi,
+        "correlation": corr,
+        "AD": ad,
+        "MAD": mad,
+        "skewness": beat_skewness,
+        "clipping_sqi": clip_sqi,
+    }
 
-    "dtw_distance": dtw_distance,
-    "template_sqi": template_sqi,
-    "correlation": corr,
-    "AD": ad,
-    "MAD": mad,
-    "skewness": beat_skewness,
-    "clipping_sqi": clip_sqi,
-}
-
-
-# def classify_beat(row, config):
-#     """
-#     First-pass rule-based beat rejection.
-#     These thresholds can be tuned after visual inspection.
-#     """
-#     is_bad = (
-#         row["template_sqi"] < config.min_template_sqi
-#         or row["correlation"] < config.min_corr
-#         or row["MAD"] > config.max_mad
-#         or row["clipping_sqi"] < config.min_clipping_sqi
-#     )
-
-#     return "bad" if is_bad else "good"
 
 def classify_beat(row, config):
     """
-    First-pass rule-based beat rejection.
+    Rule-based beat rejection (restored from the original pipeline).
     Also records why a beat was rejected.
     """
     reasons = []
@@ -479,53 +439,43 @@ def classify_beat(row, config):
 
 
 # ============================================================
-# MAIN BEAT-LEVEL PIPELINE
+# BEAT COMPARISON -> WINDOW ROLL-UP
 # ============================================================
 
-def run_beat_level_sqi(ppg, config=None):
+def run_beat_comparison(filtered_window, config):
     """
-    Run beat-level SQI on one PPG segment/window.
+    Segment one filtered window into beats, normalize each beat, build a
+    template from the normalized beats, compare every beat to that
+    template, classify each beat, then roll the beat labels up into a
+    window-level summary (bad if > bad_window_fraction_threshold of the
+    beats are bad).
+
+    Returns None if there aren't at least 3 beats in the window (matches
+    the original pipeline's minimum for building a usable template).
     """
-    if config is None:
-        config = BeatSQIConfig()
-
-    filtered = preprocess_ppg(ppg, config)
-
-    raw_beats, beat_indices = segment_beats_by_valleys(filtered, config)
-
-    original_beats = [
-        np.asarray(ppg[start_idx:end_idx], dtype=float) 
-        for start_idx, end_idx in beat_indices
-    ]
+    raw_beats, beat_indices = segment_beats_by_valleys(filtered_window, config)
 
     if len(raw_beats) < 3:
         return None
 
-    # Time-align beats (no amplitude change) for quality/template comparison.
-    resampled_beats = resample_beats(raw_beats, config)
-
-    # Min-max (0-1) normalized beats, for downstream use only -- NOT used
-    # for quality computation or classification.
     normalized_beats = normalize_beats(raw_beats, config)
-
-    template, template_indices = make_clean_template(resampled_beats, config)
+    template, template_indices = make_clean_template(normalized_beats, config)
 
     rows = []
 
-    for beat_number, (raw_beat, original_beat, resampled_beat, (start_idx, end_idx)) in enumerate(
-    zip(raw_beats, original_beats, resampled_beats, beat_indices)):
+    for beat_number, (raw_beat, normalized_beat, (start_idx, end_idx)) in enumerate(
+        zip(raw_beats, normalized_beats, beat_indices)
+    ):
         row = compute_beat_features(
             raw_beat=raw_beat,
-            original_beat=original_beat,
-            resampled_beat=resampled_beat,
+            normalized_beat=normalized_beat,
             template=template,
             start_idx=start_idx,
             end_idx=end_idx,
             beat_number=beat_number,
-            config=config
+            config=config,
         )
 
-        #row["beat_label"] = classify_beat(row, config)
         label, reasons = classify_beat(row, config)
         row["beat_label"] = label
         row["rejection_reasons"] = reasons
@@ -535,7 +485,7 @@ def run_beat_level_sqi(ppg, config=None):
 
     feature_table = pd.DataFrame(rows)
 
-    percent_bad = np.mean(feature_table["beat_label"] == "bad")
+    percent_bad = float(np.mean(feature_table["beat_label"] == "bad"))
 
     window_label = (
         "bad_window"
@@ -547,23 +497,67 @@ def run_beat_level_sqi(ppg, config=None):
         "num_beats": len(feature_table),
         "num_good_beats": int(np.sum(feature_table["beat_label"] == "good")),
         "num_bad_beats": int(np.sum(feature_table["beat_label"] == "bad")),
-        "percent_bad": float(percent_bad),
+        "percent_bad": percent_bad,
         "mean_template_sqi": float(feature_table["template_sqi"].mean()),
         "mean_dtw_distance": float(feature_table["dtw_distance"].mean()),
         "mean_correlation": float(feature_table["correlation"].mean()),
         "mean_MAD": float(feature_table["MAD"].mean()),
+        "mean_clipping_sqi": float(feature_table["clipping_sqi"].mean()),
+        "mean_skewness": float(feature_table["skewness"].mean()),
         "window_label": window_label,
-        "mean_perfusion_index": float(feature_table["perfusion_index"].mean()),
+    }
+
+    return {
+        "feature_table": feature_table,
+        "template": template,
+        "normalized_beats": normalized_beats,
+        "summary": summary,
+    }
+
+
+# ============================================================
+# MAIN WINDOW-LEVEL PIPELINE
+# ============================================================
+
+def run_window_level_sqi(raw_window, config=None):
+    """
+    Run the approved pipeline on one 10-second PPG window:
+
+        filter (for beat segmentation/comparison)
+        -> PI (on the RAW window, before/independent of filtering)
+        -> segment into beats -> normalize each beat
+        -> compare each beat to a template -> classify each beat
+        -> roll up to a window label (good_window / bad_window)
+
+    Returns None if the window doesn't have enough beats to build a
+    template (same >=3-beat minimum as before).
+    """
+    if config is None:
+        config = BeatSQIConfig()
+
+    raw_window = np.asarray(raw_window, dtype=float)
+    filtered = preprocess_ppg(raw_window, config)
+
+    ac_value, dc_value, perfusion_index = compute_perfusion_index(raw_window)
+
+    beat_result = run_beat_comparison(filtered, config)
+
+    if beat_result is None:
+        return None
+
+    row = {
+        "AC": ac_value,
+        "DC": dc_value,
+        "perfusion_index": perfusion_index,
+        **beat_result["summary"],
     }
 
     return {
         "filtered_signal": filtered,
-        "raw_beats": raw_beats,
-        "resampled_beats": resampled_beats,
-        "normalized_beats": normalized_beats,
-        "template": template,
-        "feature_table": feature_table,
-        "summary": summary,
+        "feature_table": beat_result["feature_table"],
+        "template": beat_result["template"],
+        "normalized_beats": beat_result["normalized_beats"],
+        "row": row,
     }
 
 
@@ -590,21 +584,25 @@ def iter_windows(signal, config):
 
 def run_sqi_over_windows(signal, condition_info, channel_label, config=None):
     """
-    Run beat-level SQI over 10-second FIU-style windows.
+    Run the approved pipeline over 10-second FIU-style windows.
+
+    Returns one DataFrame with one row per window (PI from the raw
+    window, beat-comparison SQI values rolled up to the window, good/bad
+    label, window/source info). Windows with fewer than 3 beats are
+    skipped (same as the original pipeline).
     """
     if config is None:
         config = BeatSQIConfig()
 
     window_rows = []
-    beat_rows = []
 
     for win_start, win_end, win in iter_windows(signal, config):
-        result = run_beat_level_sqi(win, config)
+        result = run_window_level_sqi(win, config)
 
         if result is None:
             continue
 
-        summary = result["summary"]
+        row = result["row"]
 
         window_row = {
             "Channel": channel_label,
@@ -613,35 +611,13 @@ def run_sqi_over_windows(signal, condition_info, channel_label, config=None):
             "WindowEndIdx": win_end,
             "WindowStartSec": win_start / config.fs,
             "WindowEndSec": win_end / config.fs,
-            **summary,
+            **row,
             **condition_info,
         }
 
         window_rows.append(window_row)
 
-        beats = result["feature_table"].copy()
-        beats["Channel"] = channel_label
-        beats["Hardware Channel"] = channel_name_map(channel_label)
-
-        # convert beat indices from local window index to full-signal index
-        beats["beat_start_idx_global"] = beats["beat_start_idx"] + win_start
-        beats["beat_end_idx_global"] = beats["beat_end_idx"] + win_start
-        beats["beat_start_sec_global"] = beats["beat_start_idx_global"] / config.fs
-        beats["beat_end_sec_global"] = beats["beat_end_idx_global"] / config.fs
-
-        for key, val in condition_info.items():
-            beats[key] = val
-
-        beat_rows.append(beats)
-
-    window_df = pd.DataFrame(window_rows)
-
-    if beat_rows:
-        beat_df = pd.concat(beat_rows, ignore_index=True)
-    else:
-        beat_df = pd.DataFrame()
-
-    return window_df, beat_df
+    return pd.DataFrame(window_rows)
 
 def parse_day4_folder(folder_name):
     """
@@ -704,7 +680,6 @@ def process_experiment1_complete(
     os.makedirs(output_root, exist_ok=True)
 
     all_window_results = []
-    all_beat_results = []
     all_summary_results = []
 
 
@@ -775,7 +750,7 @@ def process_experiment1_complete(
                 signal = cleaned_df[col].values
 
                 try:
-                    window_df, beat_df = run_sqi_over_windows(
+                    window_df = run_sqi_over_windows(
                         signal=signal,
                         condition_info=condition_info,
                         channel_label=col,
@@ -785,13 +760,14 @@ def process_experiment1_complete(
                         print("\n--------------------------------")
                         print(f"Condition: {folder_name}")
                         print(f"Channel: {col}")
+                        print(f"Mean PI: {window_df['perfusion_index'].mean():.4f}%")
                         print(f"Mean DTW: {window_df['mean_dtw_distance'].mean():.4f}")
                         print(f"Mean Correlation: {window_df['mean_correlation'].mean():.4f}")
                         print(f"Mean MAD: {window_df['mean_MAD'].mean():.4f}")
-                        print(f"Mean PI: {window_df['mean_perfusion_index'].mean():.4f}%")
 
                         good_windows = (window_df["window_label"] == "good_window").sum()
                         total_windows = len(window_df)
+                        bad_windows = total_windows - good_windows
 
                         good_window_fraction = (
                             good_windows / total_windows
@@ -821,9 +797,19 @@ def process_experiment1_complete(
                             "Clamp": "Yes",
                             "PolarizationPlacement": "Same",
                             "GoodWindows": int(good_windows),
+                            "BadWindows": int(bad_windows),
                             "TotalWindows": int(total_windows),
                             "GoodWindowFraction": float(
                                 good_window_fraction
+                            ),
+                            "GoodWindowPercent": float(
+                                good_window_fraction * 100.0
+                            ),
+                            "BadWindowPercent": float(
+                                (1.0 - good_window_fraction) * 100.0
+                            ),
+                            "MeanPI": float(
+                                window_df["perfusion_index"].mean()
                             ),
                             "MeanDTW": float(
                                 window_df["mean_dtw_distance"].mean()
@@ -837,12 +823,16 @@ def process_experiment1_complete(
                             "MeanTemplateSQI": float(
                                 window_df["mean_template_sqi"].mean()
                             ),
-                            "MeanPI": float(window_df["mean_perfusion_index"].mean()
+                            "MeanClippingSQI": float(
+                                window_df["mean_clipping_sqi"].mean()
+                            ),
+                            "MeanSkewness": float(
+                                window_df["mean_skewness"].mean()
                             ),
                         }
 
                         all_summary_results.append(summary_row)
-                        
+
                 except Exception as e:
                     print(f"SQI failed for {col}: {e}")
                     continue
@@ -852,23 +842,12 @@ def process_experiment1_complete(
                     window_df["Trial"] = trial_number
                     all_window_results.append(window_df)
 
-                if len(beat_df) > 0:
-                    beat_df["SourceFile"] = os.path.basename(json_path)
-                    beat_df["Trial"] = trial_number
-                    all_beat_results.append(beat_df)
-
     if all_window_results:
         final_window_df = pd.concat(all_window_results, ignore_index=True)
         window_path = os.path.join(output_root, "day2_experiment1_all_window_sqi.csv")
         final_window_df.to_csv(window_path, index=False)
         print(f"\nSaved window-level SQI results to: {window_path}")
 
-    if all_beat_results:
-        final_beat_df = pd.concat(all_beat_results, ignore_index=True)
-        beat_path = os.path.join(output_root, "day2_experiment1_all_beat_sqi.csv")
-        final_beat_df.to_csv(beat_path, index=False)
-        print(f"Saved beat-level SQI results to: {beat_path}")
-    
     if all_summary_results:
         summary_df = pd.DataFrame(all_summary_results)
 
@@ -920,7 +899,6 @@ def process_day3_experiment2(
     os.makedirs(output_root, exist_ok=True)
 
     all_window_results = []
-    all_beat_results = []
     all_summary_results = []
 
     if not os.path.exists(day3_root):
@@ -1014,7 +992,7 @@ def process_day3_experiment2(
                 signal = cleaned_df[col].values
 
                 try:
-                    window_df, beat_df = run_sqi_over_windows(
+                    window_df = run_sqi_over_windows(
                         signal=signal,
                         condition_info=condition_info,
                         channel_label=col,
@@ -1036,6 +1014,7 @@ def process_day3_experiment2(
                 ).sum()
 
                 total_windows = len(window_df)
+                bad_windows = total_windows - good_windows
 
                 good_window_fraction = (
                     good_windows / total_windows
@@ -1049,6 +1028,10 @@ def process_day3_experiment2(
                 print(f"Condition: {folder_name}")
                 print(f"Trial: {trial_number}")
                 print(f"Channel: {col}")
+                print(
+                    "Mean PI: "
+                    f"{window_df['perfusion_index'].mean():.4f}%"
+                )
                 print(
                     "Mean DTW: "
                     f"{window_df['mean_dtw_distance'].mean():.4f}"
@@ -1085,9 +1068,19 @@ def process_day3_experiment2(
                     "PhantomType": "Multilayered",
                     "PolarizationCondition": "Original",
                     "GoodWindows": int(good_windows),
+                    "BadWindows": int(bad_windows),
                     "TotalWindows": int(total_windows),
                     "GoodWindowFraction": float(
                         good_window_fraction
+                    ),
+                    "GoodWindowPercent": float(
+                        good_window_fraction * 100.0
+                    ),
+                    "BadWindowPercent": float(
+                        (1.0 - good_window_fraction) * 100.0
+                    ),
+                    "MeanPI": float(
+                        window_df["perfusion_index"].mean()
                     ),
                     "MeanDTW": float(
                         window_df["mean_dtw_distance"].mean()
@@ -1101,7 +1094,11 @@ def process_day3_experiment2(
                     "MeanTemplateSQI": float(
                         window_df["mean_template_sqi"].mean()
                     ),
-                    "MeanPI": float( window_df["mean_perfusion_index"].mean()
+                    "MeanClippingSQI": float(
+                        window_df["mean_clipping_sqi"].mean()
+                    ),
+                    "MeanSkewness": float(
+                        window_df["mean_skewness"].mean()
                     ),
                 }
 
@@ -1110,11 +1107,6 @@ def process_day3_experiment2(
                 window_df["SourceFile"] = source_file
                 window_df["Trial"] = trial_number
                 all_window_results.append(window_df)
-
-                if len(beat_df) > 0:
-                    beat_df["SourceFile"] = source_file
-                    beat_df["Trial"] = trial_number
-                    all_beat_results.append(beat_df)
 
     # --------------------------------------------------
     # SAVE WINDOW RESULTS
@@ -1138,30 +1130,6 @@ def process_day3_experiment2(
         print(
             f"\nSaved Day 3 window results to: "
             f"{window_path}"
-        )
-
-    # --------------------------------------------------
-    # SAVE BEAT RESULTS
-    # --------------------------------------------------
-    if all_beat_results:
-        final_beat_df = pd.concat(
-            all_beat_results,
-            ignore_index=True
-        )
-
-        beat_path = os.path.join(
-            output_root,
-            "day3_experiment2_all_beat_sqi.csv"
-        )
-
-        final_beat_df.to_csv(
-            beat_path,
-            index=False
-        )
-
-        print(
-            f"Saved Day 3 beat results to: "
-            f"{beat_path}"
         )
 
     # --------------------------------------------------
@@ -1212,7 +1180,6 @@ def process_day4_experiments(
     os.makedirs(output_root, exist_ok=True)
 
     all_window_results = []
-    all_beat_results = []
     all_summary_results = []
 
     for exp_label in ["Experiment 2", "Experiment 3"]:
@@ -1288,7 +1255,7 @@ def process_day4_experiments(
                     signal = cleaned_df[col].values
 
                     try:
-                        window_df, beat_df = run_sqi_over_windows(
+                        window_df = run_sqi_over_windows(
                             signal=signal,
                             condition_info=condition_info,
                             channel_label=col,
@@ -1300,17 +1267,18 @@ def process_day4_experiments(
                             print(f"Experiment: {exp_label}")
                             print(f"Condition: {folder_name}")
                             print(f"Channel: {col}")
+                            print(f"Mean PI: " f"{window_df['perfusion_index'].mean():.4f}%")
                             print(f"Mean DTW: {window_df['mean_dtw_distance'].mean():.4f}")
                             print(f"Mean Correlation: {window_df['mean_correlation'].mean():.4f}")
                             print(f"Mean MAD: {window_df['mean_MAD'].mean():.4f}")
-                            print(f"Mean PI: " f"{window_df['mean_perfusion_index'].mean():.4f}%")
 
                             good_windows = (
                                 window_df["window_label"] == "good_window"
                             ).sum()
 
                             total_windows = len(window_df)
-                            
+                            bad_windows = total_windows - good_windows
+
                             good_window_fraction = (
                                 good_windows / total_windows
                                 if total_windows > 0
@@ -1339,9 +1307,19 @@ def process_day4_experiments(
                                 "Clamp": "Yes",
                                 "PhantomType": "Multilayered",
                                 "GoodWindows": int(good_windows),
+                                "BadWindows": int(bad_windows),
                                 "TotalWindows": int(total_windows),
                                 "GoodWindowFraction": float(
                                     good_window_fraction
+                                ),
+                                "GoodWindowPercent": float(
+                                    good_window_fraction * 100.0
+                                ),
+                                "BadWindowPercent": float(
+                                    (1.0 - good_window_fraction) * 100.0
+                                ),
+                                "MeanPI": float(
+                                    window_df["perfusion_index"].mean()
                                 ),
                                 "MeanDTW": float(
                                     window_df["mean_dtw_distance"].mean()
@@ -1355,8 +1333,11 @@ def process_day4_experiments(
                                 "MeanTemplateSQI": float(
                                     window_df["mean_template_sqi"].mean()
                                 ),
-
-                                "MeanPI": float(window_df["mean_perfusion_index"].mean()
+                                "MeanClippingSQI": float(
+                                    window_df["mean_clipping_sqi"].mean()
+                                ),
+                                "MeanSkewness": float(
+                                    window_df["mean_skewness"].mean()
                                 ),
                             }
 
@@ -1371,11 +1352,6 @@ def process_day4_experiments(
                         window_df["SourceFile"] = os.path.basename(json_path)
                         window_df["Trial"] = trial_number
                         all_window_results.append(window_df)
-
-                    if len(beat_df) > 0:
-                        beat_df["SourceFile"] = os.path.basename(json_path)
-                        beat_df["Trial"] = trial_number
-                        all_beat_results.append(beat_df)
 
 
     # --------------------------------------------------
@@ -1435,65 +1411,6 @@ def process_day4_experiments(
                 print(
                     f"Saved {experiment_name} window results to: "
                     f"{experiment_window_path}"
-                )
-
-    # --------------------------------------------------
-    # SAVE BEAT-LEVEL RESULTS
-    # --------------------------------------------------
-    if all_beat_results:
-        final_beat_df = pd.concat(
-            all_beat_results,
-            ignore_index=True
-        )
-
-        # Save one combined Day 4 file
-        beat_path = os.path.join(
-            output_root,
-            "day4_all_beat_sqi.csv"
-        )
-
-        final_beat_df.to_csv(
-            beat_path,
-            index=False
-        )
-
-        print(
-            f"Saved Day 4 beat-level SQI results to: "
-            f"{beat_path}"
-        )
-
-        # Save Experiment 2 and Experiment 3 separately
-        for experiment_name in ["Experiment_2", "Experiment_3"]:
-
-            experiment_beat_df = final_beat_df[
-                final_beat_df["Experiment"] == experiment_name
-            ]
-
-            if len(experiment_beat_df) > 0:
-
-                experiment_folder = os.path.join(
-                    output_root,
-                    experiment_name
-                )
-
-                os.makedirs(
-                    experiment_folder,
-                    exist_ok=True
-                )
-
-                experiment_beat_path = os.path.join(
-                    experiment_folder,
-                    f"day4_{experiment_name.lower()}_beat_sqi.csv"
-                )
-
-                experiment_beat_df.to_csv(
-                    experiment_beat_path,
-                    index=False
-                )
-
-                print(
-                    f"Saved {experiment_name} beat results to: "
-                    f"{experiment_beat_path}"
                 )
 
     # --------------------------------------------------
@@ -1565,9 +1482,10 @@ def debug_one_file_one_channel(
 ):
     """
     Debug one recording and one channel so we can visually check:
-    1. detected valleys
-    2. normalized beats + template
-    3. good/bad beat labels
+    1. detected valleys/beats in the first window
+    2. normalized beats + template for that window
+    3. good/bad beat intervals within that window
+    4. good/bad WINDOW labels over the whole recording
     """
     config = BeatSQIConfig()
 
@@ -1581,91 +1499,155 @@ def debug_one_file_one_channel(
 
     signal = cleaned_df[channel_label].values
 
-    result = run_beat_level_sqi(signal, config=config)
+    window_df = run_sqi_over_windows(
+        signal=signal,
+        condition_info=condition_info,
+        channel_label=channel_label,
+        config=config
+    )
 
-    if result is None:
-        print("No result. Not enough beats were detected.")
+    if len(window_df) == 0:
+        print("No result. Recording is shorter than one window, or no window had enough beats.")
         return
 
-    filtered = result["filtered_signal"]
-    feature_table = result["feature_table"]
-    resampled_beats = result["resampled_beats"]
-    template = result["template"]
-
-    print("\n===== DEBUG SUMMARY =====")
+    print("\n===== DEBUG SUMMARY (window level) =====")
     print(f"Channel: {channel_label}")
-    print(result["summary"])
-    print(feature_table[[
-    "beat_number",
-    "AC",
-    "DC",
-    "perfusion_index",
-    "dtw_distance",
-    "correlation",
-    "MAD",
-    "template_sqi",
-    "clipping_sqi",
-    "beat_label",
-    "rejection_reasons"
+    print(window_df[[
+        "WindowStartSec",
+        "WindowEndSec",
+        "AC",
+        "DC",
+        "perfusion_index",
+        "num_beats",
+        "num_bad_beats",
+        "mean_dtw_distance",
+        "mean_correlation",
+        "mean_MAD",
+        "mean_template_sqi",
+        "window_label",
     ]])
 
-
-    # Plot 1: filtered PPG with detected valleys
-    t = np.arange(len(filtered)) / config.fs
-    valley_idxs = feature_table["beat_start_idx"].values.astype(int)
-
-    plt.figure(figsize=(10, 4))
-    plt.plot(t, filtered, linewidth=1.2)
-    plt.scatter(
-        valley_idxs / config.fs,
-        filtered[valley_idxs],
-        marker="v",
-        s=50,
-        label="Detected valleys"
+    good_windows = (window_df["window_label"] == "good_window").sum()
+    total_windows = len(window_df)
+    print(
+        f"Good Windows: {good_windows}/{total_windows} "
+        f"({100.0 * good_windows / total_windows:.1f}% good, "
+        f"{100.0 * (total_windows - good_windows) / total_windows:.1f}% bad)"
     )
-    plt.title(f"{channel_label}: Filtered PPG with Detected Valleys")
-    plt.xlabel("Time (s)")
-    plt.ylabel("Filtered PPG")
-    plt.legend()
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    plt.show()
 
-    # Plot 2: time-aligned beats (raw amplitude) + template
-    plt.figure(figsize=(8, 4))
-    for beat in resampled_beats:
-        plt.plot(beat, alpha=0.25, linewidth=1)
+    # Detailed beat-level look at the first window that had enough beats
+    win_len = int(config.window_seconds * config.fs)
+    detail_result = None
+    detail_start = None
 
-    plt.plot(template, linewidth=3, label="Template beat")
-    plt.title(f"{channel_label}: Time-Aligned Beats + Template (raw amplitude)")
-    plt.xlabel("Resampled sample")
-    plt.ylabel("Filtered amplitude")
-    plt.legend()
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    plt.show()
+    for win_start, win_end, win in iter_windows(signal, config):
+        detail_result = run_window_level_sqi(win, config)
+        if detail_result is not None:
+            detail_start = win_start
+            break
 
-    # Plot 3: good/bad beat intervals
+    if detail_result is None:
+        print("No window had enough beats for a detailed beat-level plot.")
+    else:
+        filtered = detail_result["filtered_signal"]
+        feature_table = detail_result["feature_table"]
+        normalized_beats = detail_result["normalized_beats"]
+        template = detail_result["template"]
+
+        print(f"\n===== DEBUG SUMMARY (beat level, window starting at {detail_start / config.fs:.1f}s) =====")
+        print(feature_table[[
+            "beat_number",
+            "dtw_distance",
+            "correlation",
+            "MAD",
+            "template_sqi",
+            "clipping_sqi",
+            "beat_label",
+            "rejection_reasons",
+        ]])
+
+        # Plot 1: filtered window with detected valleys
+        t_win = np.arange(len(filtered)) / config.fs
+        valley_idxs = feature_table["beat_start_idx"].values.astype(int)
+
+        plt.figure(figsize=(10, 4))
+        plt.plot(t_win, filtered, linewidth=1.2)
+        plt.scatter(
+            valley_idxs / config.fs,
+            filtered[valley_idxs],
+            marker="v",
+            s=50,
+            label="Detected valleys"
+        )
+        plt.title(f"{channel_label}: Filtered Window with Detected Valleys")
+        plt.xlabel("Time (s)")
+        plt.ylabel("Filtered PPG")
+        plt.legend()
+        plt.grid(True, linestyle="--", alpha=0.4)
+        plt.tight_layout()
+        plt.show()
+
+        # Plot 2: normalized beats + template
+        plt.figure(figsize=(8, 4))
+        for beat in normalized_beats:
+            plt.plot(beat, alpha=0.25, linewidth=1)
+
+        plt.plot(template, linewidth=3, label="Template beat")
+        plt.title(f"{channel_label}: Normalized Beats + Template")
+        plt.xlabel("Resampled sample")
+        plt.ylabel("Normalized amplitude (0-1)")
+        plt.legend()
+        plt.grid(True, linestyle="--", alpha=0.4)
+        plt.tight_layout()
+        plt.show()
+
+        # Plot 3: good/bad beat intervals within this window
+        plt.figure(figsize=(10, 4))
+        plt.plot(t_win, filtered, linewidth=1.2, color="black")
+
+        for _, row in feature_table.iterrows():
+            start = row["beat_start_idx"] / config.fs
+            end = row["beat_end_idx"] / config.fs
+
+            if row["beat_label"] == "good":
+                plt.axvspan(start, end, color="green", alpha=0.18)
+            else:
+                plt.axvspan(start, end, color="red", alpha=0.30)
+
+        plt.title(f"{channel_label}: Good vs Bad Beat Intervals")
+        plt.xlabel("Time (s)")
+        plt.ylabel("Filtered PPG")
+        plt.grid(True, linestyle="--", alpha=0.4)
+
+        plt.plot([], [], color="green", linewidth=8, alpha=0.4, label="Good beat")
+        plt.plot([], [], color="red", linewidth=8, alpha=0.4, label="Bad beat")
+        plt.legend()
+
+        plt.tight_layout()
+        plt.show()
+
+    # Plot 4: good/bad WINDOW shading over the whole recording
+    t_full = np.arange(len(signal)) / config.fs
+
     plt.figure(figsize=(10, 4))
-    plt.plot(t, filtered, linewidth=1.2, color="black")
+    plt.plot(t_full, signal, linewidth=1.0, color="black", alpha=0.7)
 
-    for _, row in feature_table.iterrows():
-        start = row["beat_start_idx"] / config.fs
-        end = row["beat_end_idx"] / config.fs
+    for _, row in window_df.iterrows():
+        start = row["WindowStartSec"]
+        end = row["WindowEndSec"]
 
-        if row["beat_label"] == "good":
-            plt.axvspan(start, end, color="green", alpha=0.18)
+        if row["window_label"] == "good_window":
+            plt.axvspan(start, end, color="green", alpha=0.08)
         else:
-            plt.axvspan(start, end, color="red", alpha=0.30)
+            plt.axvspan(start, end, color="red", alpha=0.12)
 
-    plt.title(f"{channel_label}: Good vs Bad Beat Intervals")
+    plt.title(f"{channel_label}: Good vs Bad Windows")
     plt.xlabel("Time (s)")
-    plt.ylabel("Filtered PPG")
+    plt.ylabel("Raw PPG")
     plt.grid(True, linestyle="--", alpha=0.4)
 
-    # fake legend handles
-    plt.plot([], [], color="green", linewidth=8, alpha=0.4, label="Good beat")
-    plt.plot([], [], color="red", linewidth=8, alpha=0.4, label="Bad beat")
+    plt.plot([], [], color="green", linewidth=8, alpha=0.3, label="Good window")
+    plt.plot([], [], color="red", linewidth=8, alpha=0.3, label="Bad window")
     plt.legend()
 
     plt.tight_layout()
