@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 
 import numpy as np
 import pandas as pd
-from scipy.signal import cheby2, sosfiltfilt, find_peaks, resample
+from scipy.signal import cheby2, sosfiltfilt, find_peaks, resample, welch
 from scipy.stats import skew
 
 try:
@@ -31,6 +31,21 @@ CHANNEL_MAP = {
     "Cross-Polarized": {"Green": "c19", "Red": "c18", "IR": "c21"},
 }
 
+# Folder names aren't fully consistent across days: some Day 3/4 folders say
+# "Light" for the fair phantom, and some polarization labels end in a stray
+# period ("Og. Pol." vs "Og. Pol"). Normalize so conditions group correctly.
+SKIN_TONE_ALIASES = {"Light": "Fair"}
+
+
+def normalize_skin_tone(skin):
+    skin = skin.strip().capitalize()
+    return SKIN_TONE_ALIASES.get(skin, skin)
+
+
+def normalize_polarization_label(pol):
+    return pol.strip().rstrip(".").strip()
+
+
 WAVELENGTH_NM = {
     "Green": 525,
     "Red": 660,
@@ -42,12 +57,13 @@ WAVELENGTH_NM = {
 class BeatSQIConfig:
     """
     Config for the approved pipeline (per 10-second window):
-      filter -> PI (from the RAW window, not the filtered one)
-             -> segment into beats (on the filtered signal)
+      filter -> segment into beats (on the filtered signal)
+             -> PI for each beat (from the RAW beat, same beat boundaries)
              -> normalize each beat (0-1)
              -> compare each beat to a template
              -> classify each beat -> roll up to a window label
                 (bad if > bad_window_fraction_threshold of beats are bad)
+             -> window PI = median of that window's beat PIs
     """
     fs: int = FS
 
@@ -65,24 +81,31 @@ class BeatSQIConfig:
     min_hr: float = 40
     max_hr: float = 180
     valley_prominence: Optional[float] = None
+    # Valleys must be at least this fraction of the window's own pulse
+    # period apart (period taken from the window's dominant frequency).
+    # Stops the secondary notch in slower pulses from being counted as a
+    # separate beat (Sept 2026: Slow recordings were being split in two).
+    min_valley_spacing_fraction: float = 0.6
 
     # Beat normalization + template
     target_beat_length: int = 50
     n_template_beats: int = 12
     template_corr_threshold: float = 0.80
 
-    # Beat classification thresholds -- back to the original values.
-    # (Sept 2026: briefly retuned sqi_lambda/min_template_sqi/max_mad using
-    # real per-beat data -- see project notes -- since the values below are
-    # calibrated for the pre-normalization amplitude scale and essentially
-    # never fire on beats that have been through per-beat 0-1 normalization.
-    # Reverted because the retuning barely moved the overall good/bad split
-    # -- correlation and clipping were already catching nearly the same
-    # beats -- so decided it wasn't worth carrying non-standard values for.)
-    sqi_lambda: float = 0.30
+    # Beat classification thresholds.
+    # sqi_lambda: Zia et al. (2020) value, used with their normalization
+    # SQI = exp(-lambda * D / L), L = warping path length (see
+    # compute_dtw_distance). This was also the pipeline's original value;
+    # it had been changed to 0.30 on Sept 1 when the metrics briefly ran on
+    # real (non-normalized) amplitudes, and was never set back afterwards.
+    # (Sept 2026, after Rutendo's review.)
+    #
+    # MAD is no longer used as a rejection rule: it isn't an SQI in either
+    # reference paper, and the old max_mad = 30 could never be reached on
+    # 0-1 normalized beats. MAD is still saved as a descriptive column.
+    sqi_lambda: float = 25.0
     min_template_sqi: float = 0.05
     min_corr: float = 0.80
-    max_mad: float = 30.0
     min_clipping_sqi: float = 0.80
 
     # Window rejection: bad if more than this fraction of a window's beats
@@ -195,13 +218,20 @@ def preprocess_ppg(ppg, config):
 
 def compute_perfusion_index(signal):
     """
-    Compute the perfusion index (PI) of one signal. Called once per
-    10-second window, on the RAW (unfiltered) window signal -- per Mark's
-    feedback, computing PI from the bandpass-FILTERED signal blows up
-    (the filter removes the DC/baseline component, so dividing by a
-    near-zero "DC" sends PI into the hundreds/thousands of percent).
+    Compute the perfusion index (PI) of ONE BEAT of the RAW (unfiltered)
+    signal. Beat boundaries come from valley detection on the filtered
+    window; the same indices are used to cut the raw window.
 
-    DC = trough / minimum of the signal
+    Why per beat (Rutendo's review, Sept 2026): taking max/min over a whole
+    10-second window folds baseline drift and artifacts into "AC". Doing it
+    beat by beat keeps AC to one pulse, and the window PI is then the
+    median across beats (robust to a few odd beats).
+
+    Why raw, not filtered: the bandpass filter removes the DC baseline, so
+    dividing by a near-zero "DC" sends PI into the hundreds/thousands of
+    percent.
+
+    DC = trough / minimum of the beat
     AC = peak - DC
     PI = (AC / DC) * 100
     """
@@ -226,12 +256,46 @@ def compute_perfusion_index(signal):
 # BEAT SEGMENTATION
 # ============================================================
 
+def estimate_pulse_period_samples(ppg, config):
+    """
+    Estimate the window's pulse period (in samples) from its dominant
+    frequency inside the bandpass range. Returns None if it can't.
+    """
+    ppg = np.asarray(ppg, dtype=float)
+    if len(ppg) < 2 * config.fs or np.std(ppg) == 0:
+        return None
+
+    freqs, power = welch(ppg - np.mean(ppg), fs=config.fs, nperseg=len(ppg))
+    band = (freqs >= config.lowcut) & (freqs <= config.highcut)
+    if not np.any(band):
+        return None
+
+    dominant_freq = freqs[band][np.argmax(power[band])]
+    if dominant_freq <= 0:
+        return None
+
+    return config.fs / dominant_freq
+
+
 def segment_beats_by_valleys(ppg, config):
     """
     Extract non-overlapping beats using valley-to-valley intervals, on the
     filtered window signal.
+
+    Minimum valley spacing = the larger of
+      - one beat at max_hr, and
+      - min_valley_spacing_fraction x the window's own pulse period.
+    The second rule keeps a pulse's secondary notch from being counted as
+    its own valley (which was splitting every Slow-speed beat in two).
     """
     min_distance = int(config.fs * 60.0 / config.max_hr)
+
+    period = estimate_pulse_period_samples(ppg, config)
+    if period is not None:
+        min_distance = max(
+            min_distance,
+            int(config.min_valley_spacing_fraction * period),
+        )
 
     valleys, _ = find_peaks(
         -ppg,
@@ -335,18 +399,27 @@ def make_clean_template(normalized_beats, config):
 # ============================================================
 
 def compute_dtw_distance(beat, template):
-    """Compare beat to template with DTW."""
+    """
+    Compare beat to template with DTW, normalized the way Zia et al. (2020)
+    do it: D(s,t) / L(s,t), where D is the summed distance along the warping
+    path and L is the length of that path.
+
+    Uses the "symmetric1" step pattern so every step on the path counts
+    once (dtw-python's default, "symmetric2", double-weights diagonal steps
+    and its normalizedDistance divides by N+M instead of the path length).
+    """
     if dtw is None:
         raise ImportError("Please install dtw-python using: pip install dtw-python")
 
-    alignment = dtw(beat, template, keep_internals=False)
-    return float(alignment.normalizedDistance)
+    alignment = dtw(beat, template, step_pattern="symmetric1", keep_internals=False)
+    path_length = len(alignment.index1)
+    return float(alignment.distance / path_length)
 
 
 def compute_template_sqi(dtw_distance, config):
     """
-    Convert DTW distance into SQI. Small distance = high SQI, large
-    distance = low SQI.
+    Zia et al. (2020) distance-based SQI: exp(-lambda * D / L), where
+    dtw_distance is already D / L. Small distance = high SQI.
     """
     return float(np.exp(-config.sqi_lambda * dtw_distance))
 
@@ -374,12 +447,19 @@ def clipping_sqi(signal):
     return float(1.0 - clipped_fraction)
 
 
-def compute_beat_features(raw_beat, normalized_beat, template, start_idx, end_idx, beat_number, config):
+def compute_beat_features(raw_beat, unfiltered_beat, normalized_beat, template, start_idx, end_idx, beat_number, config):
     """
-    Compute beat-level SQI features -- DTW distance, correlation, AD, MAD,
-    skewness, clipping -- by comparing the NORMALIZED beat to the template
-    (also built from normalized beats), matching the approved pipeline
-    order (normalize the beat, then compare to template).
+    Compute beat-level features by comparing the NORMALIZED beat to the
+    template (also built from normalized beats):
+      - dtw_distance / template_sqi: Zia et al. (2020) distance-based SQI
+      - correlation: Li & Clifford (2012) "linear resampling" SQI (beat
+        resampled to a fixed length, then correlated with the template)
+      - clipping_sqi: our own clipping check, loosely based on Li &
+        Clifford's clipping detection
+      - MAD, skewness: descriptive only (not used to reject beats)
+    Plus the beat's perfusion index from the RAW (unfiltered) beat.
+    (AD was dropped: with every beat resampled to target_beat_length
+    points, AD = target_beat_length * MAD exactly, so it added nothing.)
     """
     difference = normalized_beat - template
 
@@ -388,9 +468,9 @@ def compute_beat_features(raw_beat, normalized_beat, template, start_idx, end_id
 
     corr = max(0.0, safe_corr(normalized_beat, template))
     mad = float(np.mean(np.abs(difference)))
-    ad = float(np.sum(np.abs(difference)))
     beat_skewness = float(skew(normalized_beat, nan_policy="omit"))
     clip_sqi = clipping_sqi(raw_beat)
+    beat_ac, beat_dc, beat_pi = compute_perfusion_index(unfiltered_beat)
 
     duration_sec = (end_idx - start_idx) / config.fs
     estimated_hr = 60.0 / duration_sec if duration_sec > 0 else np.nan
@@ -407,10 +487,13 @@ def compute_beat_features(raw_beat, normalized_beat, template, start_idx, end_id
         "dtw_distance": dtw_distance,
         "template_sqi": template_sqi,
         "correlation": corr,
-        "AD": ad,
         "MAD": mad,
         "skewness": beat_skewness,
         "clipping_sqi": clip_sqi,
+
+        "beat_AC": beat_ac,
+        "beat_DC": beat_dc,
+        "beat_pi": beat_pi,
     }
 
 
@@ -427,9 +510,6 @@ def classify_beat(row, config):
     if row["correlation"] < config.min_corr:
         reasons.append("low_correlation")
 
-    if row["MAD"] > config.max_mad:
-        reasons.append("high_MAD")
-
     if row["clipping_sqi"] < config.min_clipping_sqi:
         reasons.append("clipping")
 
@@ -442,13 +522,17 @@ def classify_beat(row, config):
 # BEAT COMPARISON -> WINDOW ROLL-UP
 # ============================================================
 
-def run_beat_comparison(filtered_window, config):
+def run_beat_comparison(filtered_window, raw_window, config):
     """
     Segment one filtered window into beats, normalize each beat, build a
     template from the normalized beats, compare every beat to that
     template, classify each beat, then roll the beat labels up into a
     window-level summary (bad if > bad_window_fraction_threshold of the
     beats are bad).
+
+    The same beat boundaries are used to cut the RAW window, and PI is
+    computed per raw beat. The window's PI is the median of its beat PIs
+    (mean and SD of the beat PIs are saved too).
 
     Returns None if there aren't at least 3 beats in the window (matches
     the original pipeline's minimum for building a usable template).
@@ -468,6 +552,7 @@ def run_beat_comparison(filtered_window, config):
     ):
         row = compute_beat_features(
             raw_beat=raw_beat,
+            unfiltered_beat=raw_window[start_idx:end_idx],
             normalized_beat=normalized_beat,
             template=template,
             start_idx=start_idx,
@@ -493,7 +578,14 @@ def run_beat_comparison(filtered_window, config):
         else "good_window"
     )
 
+    beat_pis = feature_table["beat_pi"].replace([np.inf, -np.inf], np.nan)
+
     summary = {
+        "AC": float(feature_table["beat_AC"].median()),
+        "DC": float(feature_table["beat_DC"].median()),
+        "perfusion_index": float(beat_pis.median()),
+        "mean_beat_pi": float(beat_pis.mean()),
+        "std_beat_pi": float(beat_pis.std()),
         "num_beats": len(feature_table),
         "num_good_beats": int(np.sum(feature_table["beat_label"] == "good")),
         "num_bad_beats": int(np.sum(feature_table["beat_label"] == "bad")),
@@ -524,8 +616,8 @@ def run_window_level_sqi(raw_window, config=None):
     Run the approved pipeline on one 10-second PPG window:
 
         filter (for beat segmentation/comparison)
-        -> PI (on the RAW window, before/independent of filtering)
-        -> segment into beats -> normalize each beat
+        -> segment into beats -> PI per RAW beat (window PI = median)
+        -> normalize each beat
         -> compare each beat to a template -> classify each beat
         -> roll up to a window label (good_window / bad_window)
 
@@ -538,19 +630,12 @@ def run_window_level_sqi(raw_window, config=None):
     raw_window = np.asarray(raw_window, dtype=float)
     filtered = preprocess_ppg(raw_window, config)
 
-    ac_value, dc_value, perfusion_index = compute_perfusion_index(raw_window)
-
-    beat_result = run_beat_comparison(filtered, config)
+    beat_result = run_beat_comparison(filtered, raw_window, config)
 
     if beat_result is None:
         return None
 
-    row = {
-        "AC": ac_value,
-        "DC": dc_value,
-        "perfusion_index": perfusion_index,
-        **beat_result["summary"],
-    }
+    row = dict(beat_result["summary"])
 
     return {
         "filtered_signal": filtered,
@@ -633,9 +718,9 @@ def parse_day4_folder(folder_name):
         raise ValueError(f"Could not parse Day 4 folder name: {folder_name}")
 
     wavelength = parts[0]
-    skin = parts[1].capitalize()
+    skin = normalize_skin_tone(parts[1])
     orientation = parts[2]
-    pol = " ".join(parts[3:])
+    pol = normalize_polarization_label(" ".join(parts[3:]))
 
     return wavelength, skin, orientation, pol
 
@@ -655,7 +740,7 @@ def parse_day3_folder(folder_name):
         )
 
     wavelength = parts[0].capitalize()
-    skin = parts[1].capitalize()
+    skin = normalize_skin_tone(parts[1])
 
     return wavelength, skin
 
@@ -1155,6 +1240,20 @@ def process_day3_experiment2(
 
 
 
+def merge_shared_recordings(df, key_cols):
+    """
+    Some Day 4 recordings (IR 0-degree Og. Pol) are used in BOTH Experiment 2
+    and Experiment 3. Keep them in each experiment's own file, but only once
+    in the combined Day 4 file, labeled with both experiments.
+    """
+    experiments_per_file = df.groupby("SourceFile")["Experiment"].agg(
+        lambda s: " & ".join(sorted(set(s)))
+    )
+    merged = df.copy()
+    merged["Experiment"] = merged["SourceFile"].map(experiments_per_file)
+    return merged.drop_duplicates(subset=key_cols).reset_index(drop=True)
+
+
 def process_day4_experiments(
     day4_root="Experiment 2 & 3 (Day 4) copy",
     output_root="FIU_Beat_Level_SQI/Day_4"
@@ -1369,7 +1468,10 @@ def process_day4_experiments(
             "day4_all_window_sqi.csv"
         )
 
-        final_window_df.to_csv(
+        merge_shared_recordings(
+            final_window_df,
+            key_cols=["SourceFile", "Channel", "WindowStartIdx"],
+        ).to_csv(
             window_path,
             index=False
         )
@@ -1424,7 +1526,10 @@ def process_day4_experiments(
             "day4_recording_summary.csv"
         )
 
-        summary_df.to_csv(
+        merge_shared_recordings(
+            summary_df,
+            key_cols=["SourceFile", "Channel"],
+        ).to_csv(
             summary_path,
             index=False
         )
@@ -1560,6 +1665,7 @@ def debug_one_file_one_channel(
             "dtw_distance",
             "correlation",
             "MAD",
+            "beat_pi",
             "template_sqi",
             "clipping_sqi",
             "beat_label",

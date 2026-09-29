@@ -22,8 +22,8 @@ The current pipeline is designed to:
 - process only uncompressed `.json` recordings to avoid analyzing duplicate `.json.gz` files
 - extract the PPG channels of interest
 - divide each recording into 10-second windows
-- filter each window and calculate its perfusion index (PI) from the raw, unfiltered window signal
-- detect individual pulse beats within the filtered window
+- filter each window and detect individual pulse beats within the filtered window
+- calculate a perfusion index (PI) for each beat from the raw, unfiltered signal, and summarize it per window (median across beats)
 - normalize each beat individually and build a representative beat template from the normalized beats
 - compare individual beats to that template
 - calculate multiple signal quality metrics for each beat
@@ -53,6 +53,27 @@ Mark and Rutendo clarified that we still needed real beat-to-beat comparison, an
 - Perfusion index moved from a beat-level metric to a window-level one, and is now calculated from the **raw, unfiltered** window signal instead of the filtered one. Filtering removes the DC baseline that PI needs, which is what was causing PI to blow up in the window-level-only attempt above.
 - Beat quality is still decided beat-by-beat, but the beat-level CSV is no longer saved on its own -- each window's beat results are now summarized directly into the window-level CSV (mean DTW distance, mean correlation, mean MAD, percent of bad beats, etc.) instead of writing out one row per beat.
 - The SQI thresholds (`sqi_lambda`, `min_template_sqi`, `max_mad`) were briefly retuned using real per-beat percentile data, since they were calibrated for the old real-amplitude scale and barely triggered on the new normalized one. The retuned values barely changed the overall good/bad split, so we reverted back to the original thresholds and documented the reasoning in the code instead of carrying non-standard values forward.
+
+**September 2026 (Rutendo's review):** Rutendo went through the code against the two reference papers (Li & Clifford 2012; Zia et al. 2020) and raised a few issues, which led to these changes:
+
+- **PI is now calculated per beat, not per window.** Taking the max and min of a whole 10-second window lets baseline drift or an artifact inflate "AC". PI is now calculated for each beat on the raw signal (using the same beat boundaries found on the filtered signal), and the window's PI is the median across its beats. The mean and SD of the beat PIs are saved too.
+- **The DTW-based SQI now follows Zia et al. exactly:** SQI = exp(-λ · D/L), where L is the length of the warping path. Before, we used `dtw-python`'s `normalizedDistance`, which divides by the two beats' lengths added together (N + M) rather than L, and uses a step pattern that double-counts diagonal steps.
+- **λ is back to 25 (Zia et al.'s value).** 25 was the pipeline's original value too; it was changed to 0.30 on Sept 1 when the metrics briefly ran on real amplitudes, and it was never changed back once beats were normalized again. So 0.30 was never tuned on FIU data.
+- **AD was removed.** Every beat is resampled to 50 points, so AD = 50 × MAD exactly and it added nothing.
+- **MAD is no longer used to reject beats.** It isn't an SQI in either reference paper (it was something we added), and the old `max_mad = 30` could never be reached on 0-to-1 normalized beats. MAD is still saved as a descriptive column.
+
+**September 2026 (results review):** Going through the saved results turned up a few more issues:
+
+- **Beat segmentation fix.** In the Slow (60 BPM label) recordings, each pulse has a deep trough followed by a shallow secondary notch, and the valley detector was counting both, splitting every beat in two. Slow windows were only 1.2% good vs. ~25% at the other speeds. Valleys now have to be at least 60% of the window's own pulse period apart (period taken from the window's dominant frequency), on top of the old max-HR spacing. Slow went from 1.2% to 30.6% good; Fast and Intermediate barely changed (25.2 → 25.4%, 24.7 → 24.9%).
+- **Condition labels normalized.** "Light" is now mapped to "Fair" for skin tone, and the trailing period in "Og. Pol." is dropped, so conditions group correctly across folders.
+- **Day 4 combined files no longer double-count.** The IR 0° Og. Pol recordings are used in both Experiment 2 and Experiment 3. They still appear in each experiment's own files, but only once in the combined Day 4 files, labeled "Experiment_2 & Experiment_3".
+- **Old beat-level CSVs archived.** The Aug 31 `*_beat_sqi.csv` files (old pipeline) were moved to `FIU_Beat_Level_SQI/_archive_old_beat_sqi_aug31/` so they aren't mistaken for current results.
+
+Still open (needs Mark/Rutendo):
+
+- **Clipping SQI doesn't measure clipping at 25 Hz.** For a typical beat it works out to exactly 1 − 2/N (N = samples in the beat), because it's only counting the single max and min sample. So the 0.80 cutoff just rejects beats shorter than 10 samples, and it fails ~21% of beats that correlate ≥ 0.95 with the template. In a 22-file sample, removing it takes good windows from ~36% to ~61%. Options: replace it with a real saturation check, or drop it.
+- **Actual pump rates don't match the labels.** The spectra show ~72 / 105 / 130 BPM for Slow / Intermediate / Fast, not 60 / 90 / 120 (the 25 Hz sampling rate checks out against the timestamps).
+- **Time gaps inside recordings.** About half of the Day 2 files have a jump in their timestamps (often > 30 s), and the loader joins the pieces end to end, so windows crossing the join mix two separate stretches of recording.
 
 ---
 
@@ -261,11 +282,11 @@ The overall structure of the analysis is:
 ```text
 Recording
     ↓
-Windows  →  Perfusion Index (from the raw window)
+Windows
     ↓
 Individual Beats (segmented from the filtered window)
     ↓
-Beat-Level SQI Metrics
+Beat-Level SQI Metrics  +  Beat-Level PI (from the raw beat)
     ↓
 Window-Level Good/Bad Label
 ```
@@ -352,6 +373,8 @@ After the signal has been divided into windows, individual pulse beats are detec
 
 The beats are segmented from valley to valley so that each segment represents approximately one complete pulse cycle.
 
+To keep a pulse's secondary notch from being counted as its own valley, valleys must be at least 60% of the window's pulse period apart. The period comes from the window's dominant frequency.
+
 This gives us individual waveforms that can be compared instead of only looking at the average behavior of the entire window.
 
 ---
@@ -380,22 +403,25 @@ A beat that looks very similar to the template is more likely to represent a con
 
 Rather than relying on only one measurement, the pipeline uses multiple SQI metrics to describe different parts of beat quality. Except for clipping, these are all calculated on the *normalized* version of the beat (see "Normalizing Beats Before Comparison" above) -- so they're comparing shape and relative amplitude within a standardized 0-to-1 range, not raw signal height.
 
-The main metrics currently include:
+The metrics used to accept or reject a beat are:
 
-- Dynamic Time Warping (DTW)
-- correlation
-- Mean Absolute Deviation (MAD)
-- template-based signal quality information
-- clipping
-- beat acceptance
+- DTW-based template SQI (Zia et al. 2020)
+- correlation after linear resampling (Li & Clifford 2012)
+- clipping (our own check, loosely based on Li & Clifford's clipping detection)
 
-Perfusion index (PI) is calculated separately, once per window rather than per beat -- see "Window-Level Perfusion Index" below.
+MAD and skewness are also calculated and saved, but only as descriptive values -- they are not used to reject beats.
+
+Perfusion index (PI) is calculated for each beat too, from the raw signal -- see "Perfusion Index" below.
+
+**What we took from each paper vs. what we changed.** Li & Clifford calculate three correlation-based SQIs (direct matching, correlation after linear resampling, and correlation after DTW alignment) plus a clipping check. We only use the linear-resampling correlation. For DTW we use Zia et al.'s distance-based SQI instead of Li & Clifford's DTW correlation. Our clipping formula is our own.
 
 ---
 
 ## Dynamic Time Warping (DTW)
 
 Dynamic Time Warping measures how different an individual beat's shape is from the representative beat template, using the normalized versions of both.
+
+Following Zia et al. (2020), the DTW distance D is divided by the length L of the warping path, and turned into a template SQI with SQI = exp(-λ · D/L), with λ = 25.
 
 It allows for small differences in timing while still comparing the overall morphology of the waveforms.
 
@@ -421,7 +447,9 @@ A high correlation suggests that the beat follows the general waveform shape exp
 
 ---
 
-## Mean Absolute Deviation (MAD)
+## Mean Absolute Deviation (MAD) -- descriptive only
+
+MAD isn't from either reference paper, so it is no longer used to reject beats; it's kept as a descriptive column. (AD, the summed version, was removed because AD = 50 × MAD exactly once beats are resampled to 50 points.)
 
 MAD measures the average difference between an individual beat and the representative template, sample by sample, using the normalized versions of both. Unlike correlation, MAD is still affected by height -- it's just the *normalized* height now, so it's picking up on shape differences that survive normalization rather than raw amplitude differences.
 
@@ -463,9 +491,11 @@ A future version of the pipeline could use these SQIs as features for a machine-
 
 ---
 
-# Window-Level Perfusion Index
+# Perfusion Index
 
-Perfusion index is calculated once per **window**, from the raw, unfiltered window signal -- not per beat, and not from the filtered signal.
+Perfusion index is calculated for each **beat**, from the raw, unfiltered signal, using the same beat boundaries found on the filtered signal. Each window's PI is then the **median** of its beat PIs (the mean and SD of the beat PIs are saved as `mean_beat_pi` and `std_beat_pi`).
+
+An earlier version calculated one PI per window from the max and min of the whole 10-second window. That lets baseline drift or a single artifact inflate "AC", so it was changed after Rutendo's review.
 
 Perfusion index represents the strength of the pulsatile part of the signal relative to the baseline signal.
 
@@ -482,7 +512,7 @@ where:
 
 A larger PI generally represents a stronger pulsatile component relative to the baseline.
 
-PI is calculated on the raw window specifically because our bandpass filter removes the DC baseline on purpose -- if PI were calculated on the filtered signal, DC would be artificially close to zero, and dividing by a near-zero number is what was sending PI up to hundreds or thousands of percent in an earlier version of the pipeline (see "Recent Pipeline Updates" above).
+PI is calculated on the raw signal specifically because our bandpass filter removes the DC baseline on purpose -- if PI were calculated on the filtered signal, DC would be artificially close to zero, and dividing by a near-zero number is what was sending PI up to hundreds or thousands of percent in an earlier version of the pipeline (see "Recent Pipeline Updates" above).
 
 For example, within the same recording we can now investigate whether:
 
@@ -495,7 +525,7 @@ PI is currently included as an **additional measurement** rather than being used
 
 This allows us to study how PI relates to the other SQI measurements before deciding whether it should eventually contribute to window classification.
 
-One open item: a small number of windows are showing extreme PI values, and most of those trace back to one specific channel (Unpolarized_A_Green / hardware channel C5) where the raw signal itself has near-zero amplitude in those windows. This looks more like a hardware/sensor issue on that channel than a problem with the PI calculation itself, but it's still an open question for Mark and Rutendo (see Limitations).
+One open item: a small number of recordings still show extreme PI values, and they all trace back to one specific channel (Unpolarized_A_Green / hardware channel C5), where the raw signal itself has near-zero amplitude. Switching to per-beat PI shrank this a lot (recording-channel combos with mean PI > 100% went from 116 to 56, and the worst case from ~29,000% to ~480%), and all 56 remaining are on C5. This looks more like a hardware/sensor issue on that channel than a problem with the PI calculation itself, but it's still an open question for Mark and Rutendo (see Limitations).
 
 ---
 
@@ -523,7 +553,7 @@ Example:
 day2_experiment1_all_window_sqi.csv
 ```
 
-This is the most detailed output the pipeline currently saves. Each row represents one 10-second window and includes the window's perfusion index, its beat-level results summarized into means (mean DTW distance, mean correlation, mean MAD, mean template SQI, mean clipping SQI, mean skewness), the number of good/bad beats, the percent of bad beats, and the resulting good/bad window label.
+This is the most detailed output the pipeline currently saves. Each row represents one 10-second window and includes the window's perfusion index (median of its beat PIs, plus their mean and SD), its beat-level results summarized into means (mean DTW distance, mean correlation, mean MAD, mean template SQI, mean clipping SQI, mean skewness), the number of good/bad beats, the percent of bad beats, and the resulting good/bad window label.
 
 This makes it useful for seeing:
 
@@ -599,7 +629,9 @@ FIU_Beat_Level_SQI/
 
 Day 4 includes both experiment-specific files and combined Day 4 files so that we can either analyze each experiment separately or look at all Day 4 recordings together.
 
-Older `*_beat_sqi.csv` files from a previous version of the pipeline may still be sitting in these folders -- they're no longer regenerated, since beat-level detail is now summarized into the window-level CSV instead (see "Recent Pipeline Updates" above), but they haven't been deleted.
+Older `*_beat_sqi.csv` files from a previous version of the pipeline have been moved to `FIU_Beat_Level_SQI/_archive_old_beat_sqi_aug31/`. They're no longer regenerated, since beat-level detail is now summarized into the window-level CSV instead.
+
+The combined Day 4 files (`day4_all_window_sqi.csv`, `day4_recording_summary.csv`) list recordings shared by Experiments 2 and 3 only once, with Experiment = "Experiment_2 & Experiment_3".
 
 ---
 
@@ -668,11 +700,11 @@ It allows us to isolate specific variables and determine whether the device can 
 
 The current SQI thresholds are also preliminary.
 
-They provide a starting point for separating more consistent beats from lower-quality beats, but they have not yet been treated as final validated thresholds. As of the September 2026 update, the thresholds are back to their original values (see "Recent Pipeline Updates" above) -- a retuning pass using real per-beat percentile data barely changed the overall good/bad split, so it wasn't worth carrying non-standard values forward, but they should still be considered a starting point rather than final.
+They provide a starting point for separating more consistent beats from lower-quality beats, but they have not yet been treated as final validated thresholds. After Rutendo's review, λ now follows Zia et al. (25, with their D/L normalization), but `min_template_sqi`, `min_corr`, and `min_clipping_sqi` are still starting values rather than values tuned on FIU data.
 
 Two specific open items from the current results:
 
-- A small number of windows show extreme PI values, and most of those trace back to one channel -- Unpolarized_A_Green (hardware channel C5) -- where the raw signal itself has near-zero amplitude. This looks like a hardware/sensor issue on that channel rather than a problem with the PI calculation, but it hasn't been confirmed.
+- A small number of recordings still show extreme PI values, all on one channel -- Unpolarized_A_Green (hardware channel C5) -- where the raw signal itself has near-zero amplitude. This looks like a hardware/sensor issue on that channel rather than a problem with the PI calculation, but it hasn't been confirmed.
 - Clipping SQI values across real beats cluster pretty tightly (roughly 0.55-0.94, median around 0.82) right around our 0.80 cutoff, for both good and bad beats. It may be worth revisiting whether that threshold, or the clipping formula itself, needs adjusting so it separates good and bad beats more clearly.
 
 As more of the dataset is analyzed, the thresholds can be revisited again using the actual distributions of the SQI metrics.
